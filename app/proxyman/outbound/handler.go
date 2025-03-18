@@ -270,46 +270,21 @@ func (h *Handler) Dial(ctx context.Context, dest net.Destination) (stat.Connecti
 		}
 
 		if h.senderSettings.Via != nil {
-			if h.senderSettings.Via.AsAddress().String() != "255.255.255.255" {
-				outbounds := session.OutboundsFromContext(ctx)
-				ob := outbounds[len(outbounds)-1]
-				if h.senderSettings.ViaCidr == "" {
-					ob.Gateway = h.senderSettings.Via.AsAddress()
-				} else { //Get a random address.
-					ob.Gateway = ParseRandomIPv6(h.senderSettings.Via.AsAddress(), h.senderSettings.ViaCidr)
-				}
-			} else {
-				if inbound := session.InboundFromContext(ctx); inbound.Conn != nil {
-					useIncoming := false
-					localAddr := inbound.Conn.LocalAddr()
-					var localIP string
-					switch addr := localAddr.(type) {
-					case *net.UDPAddr:
-						localIP = addr.IP.String()
-					case *net.TCPAddr:
-						localIP = addr.IP.String()
-					}
-					if net.ParseAddress(localIP).Family().IsIP() {
-						if net.ParseAddress(localIP).IP().IsLoopback() {
-							if dest.Address.Family().IsIP() && dest.Address.IP().IsLoopback() {
-								useIncoming = true
-							}
-						} else if dest.Address.Family().IsIP() {
-							if dest.Address.Family().IsIPv4() == net.ParseAddress(localIP).Family().IsIPv4() {
-								useIncoming = true
-							}
-						} else if dest.Address.Family().IsDomain() {
-							// this will prevent access to single-stack domains
-							useIncoming = true
+			outbounds := session.OutboundsFromContext(ctx)
+			ob := outbounds[len(outbounds)-1]
+			if h.senderSettings.ViaCidr == "" {
+				if h.senderSettings.Via.AsAddress().Family().IsDomain() && h.senderSettings.Via.AsAddress().Domain() == "origin" {
+					if inbound := session.InboundFromContext(ctx); inbound != nil {
+						origin, _, err := net.SplitHostPort(inbound.Conn.LocalAddr().String())
+						if err == nil {
+							ob.Gateway = net.ParseAddress(origin)
 						}
 					}
-					if useIncoming {
-						outbounds := session.OutboundsFromContext(ctx)
-						ob := outbounds[len(outbounds) - 1]
-						errors.LogInfo(ctx, "egressing through incoming IP ", localIP, " for destination ", dest.String())
-						ob.Gateway = net.ParseAddress(localIP)
-					}
+				} else {
+					ob.Gateway = h.senderSettings.Via.AsAddress()
 				}
+			} else { //Get a random address.
+				ob.Gateway = ParseRandomIPv6(h.senderSettings.Via.AsAddress(), h.senderSettings.ViaCidr)
 			}
 		}
 	}
