@@ -2,6 +2,7 @@ package dns
 
 import (
 	"context"
+	go_errors "errors"
 	"io"
 	"sync"
 	"time"
@@ -186,6 +187,9 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, d internet.
 				if len(h.blockTypes) > 0 {
 					for _, blocktype := range h.blockTypes {
 						if blocktype == int32(qType) {
+							if h.nonIPQuery == "reject" {
+								go h.rejectNonIPQuery(id, qType, domain, writer)
+							}
 							errors.LogInfo(ctx, "blocked type ", qType, " query for domain ", domain)
 							return nil
 						}
@@ -195,6 +199,11 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, d internet.
 					go h.handleIPQuery(id, qType, domain, writer)
 				}
 				if isIPQuery || h.nonIPQuery == "drop" {
+					b.Release()
+					continue
+				}
+				if h.nonIPQuery == "reject" {
+					go h.rejectNonIPQuery(id, qType, domain, writer)
 					b.Release()
 					continue
 				}
@@ -236,17 +245,18 @@ func (h *Handler) handleIPQuery(id uint16, qType dnsmessage.Type, domain string,
 	var ips []net.IP
 	var err error
 
-	var ttl uint32 = 600
+	var ttl4 uint32
+	var ttl6 uint32
 
 	switch qType {
 	case dnsmessage.TypeA:
-		ips, err = h.client.LookupIP(domain, dns.IPOption{
+		ips, ttl4, err = h.client.LookupIP(domain, dns.IPOption{
 			IPv4Enable: true,
 			IPv6Enable: false,
 			FakeEnable: true,
 		})
 	case dnsmessage.TypeAAAA:
-		ips, err = h.client.LookupIP(domain, dns.IPOption{
+		ips, ttl6, err = h.client.LookupIP(domain, dns.IPOption{
 			IPv4Enable: false,
 			IPv6Enable: true,
 			FakeEnable: true,
@@ -254,13 +264,9 @@ func (h *Handler) handleIPQuery(id uint16, qType dnsmessage.Type, domain string,
 	}
 
 	rcode := dns.RCodeFromError(err)
-	if rcode == 0 && len(ips) == 0 && !errors.AllEqual(dns.ErrEmptyResponse, errors.Cause(err)) {
+	if rcode == 0 && len(ips) == 0 && !go_errors.Is(err, dns.ErrEmptyResponse) {
 		errors.LogInfoInner(context.Background(), err, "ip query")
 		return
-	}
-
-	if fkr0, ok := h.fdns.(dns.FakeDNSEngineRev0); ok && len(ips) > 0 && fkr0.IsIPInIPPool(net.IPAddress(ips[0])) {
-		ttl = 1
 	}
 
 	switch qType {
@@ -293,16 +299,17 @@ func (h *Handler) handleIPQuery(id uint16, qType dnsmessage.Type, domain string,
 	}))
 	common.Must(builder.StartAnswers())
 
-	rHeader := dnsmessage.ResourceHeader{Name: dnsmessage.MustNewName(domain), Class: dnsmessage.ClassINET, TTL: ttl}
+	rHeader4 := dnsmessage.ResourceHeader{Name: dnsmessage.MustNewName(domain), Class: dnsmessage.ClassINET, TTL: ttl4}
+	rHeader6 := dnsmessage.ResourceHeader{Name: dnsmessage.MustNewName(domain), Class: dnsmessage.ClassINET, TTL: ttl6}
 	for _, ip := range ips {
 		if len(ip) == net.IPv4len {
 			var r dnsmessage.AResource
 			copy(r.A[:], ip)
-			common.Must(builder.AResource(rHeader, r))
+			common.Must(builder.AResource(rHeader4, r))
 		} else {
 			var r dnsmessage.AAAAResource
 			copy(r.AAAA[:], ip)
-			common.Must(builder.AAAAResource(rHeader, r))
+			common.Must(builder.AAAAResource(rHeader6, r))
 		}
 	}
 	msgBytes, err := builder.Finish()
@@ -315,6 +322,38 @@ func (h *Handler) handleIPQuery(id uint16, qType dnsmessage.Type, domain string,
 
 	if err := writer.WriteMessage(b); err != nil {
 		errors.LogInfoInner(context.Background(), err, "write IP answer")
+	}
+}
+
+func (h *Handler) rejectNonIPQuery(id uint16, qType dnsmessage.Type, domain string, writer dns_proto.MessageWriter) {
+	b := buf.New()
+	rawBytes := b.Extend(buf.Size)
+	builder := dnsmessage.NewBuilder(rawBytes[:0], dnsmessage.Header{
+		ID:                 id,
+		RCode:              dnsmessage.RCodeRefused,
+		RecursionAvailable: true,
+		RecursionDesired:   true,
+		Response:           true,
+		Authoritative:      true,
+	})
+	builder.EnableCompression()
+	common.Must(builder.StartQuestions())
+	common.Must(builder.Question(dnsmessage.Question{
+		Name:  dnsmessage.MustNewName(domain),
+		Class: dnsmessage.ClassINET,
+		Type:  qType,
+	}))
+
+	msgBytes, err := builder.Finish()
+	if err != nil {
+		errors.LogInfoInner(context.Background(), err, "pack reject message")
+		b.Release()
+		return
+	}
+	b.Resize(0, int32(len(msgBytes)))
+
+	if err := writer.WriteMessage(b); err != nil {
+		errors.LogInfoInner(context.Background(), err, "write reject answer")
 	}
 }
 
