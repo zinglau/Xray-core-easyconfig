@@ -10,10 +10,12 @@ import (
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/mux"
 	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/serial"
 	"github.com/xtls/xray-core/common/task"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/transport/internet"
+	"google.golang.org/protobuf/proto"
 )
 
 type DynamicInboundHandler struct {
@@ -23,7 +25,7 @@ type DynamicInboundHandler struct {
 	receiverConfig *proxyman.ReceiverConfig
 	streamSettings *internet.MemoryStreamConfig
 	portMutex      sync.Mutex
-	portsInUse     map[net.Port]bool
+	portsInUse     map[net.Port]struct{}
 	workerMutex    sync.RWMutex
 	worker         []worker
 	lastRefresh    time.Time
@@ -39,7 +41,7 @@ func NewDynamicInboundHandler(ctx context.Context, tag string, receiverConfig *p
 		tag:            tag,
 		proxyConfig:    proxyConfig,
 		receiverConfig: receiverConfig,
-		portsInUse:     make(map[net.Port]bool),
+		portsInUse:     make(map[net.Port]struct{}),
 		mux:            mux.NewServer(ctx),
 		v:              v,
 		ctx:            ctx,
@@ -84,7 +86,7 @@ func (h *DynamicInboundHandler) allocatePort() net.Port {
 		port := net.Port(allPorts[r])
 		_, used := h.portsInUse[port]
 		if !used {
-			h.portsInUse[port] = true
+			h.portsInUse[port] = struct{}{}
 			return port
 		}
 	}
@@ -204,4 +206,17 @@ func (h *DynamicInboundHandler) GetRandomInboundProxy() (interface{}, net.Port, 
 
 func (h *DynamicInboundHandler) Tag() string {
 	return h.tag
+}
+
+// ReceiverSettings implements inbound.Handler.
+func (h *DynamicInboundHandler) ReceiverSettings() *serial.TypedMessage {
+	return serial.ToTypedMessage(h.receiverConfig)
+}
+
+// ProxySettings implements inbound.Handler.
+func (h *DynamicInboundHandler) ProxySettings() *serial.TypedMessage {
+	if v, ok := h.proxyConfig.(proto.Message); ok {
+		return serial.ToTypedMessage(v)
+	}
+	return nil
 }

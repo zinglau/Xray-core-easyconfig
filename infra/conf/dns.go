@@ -1,7 +1,11 @@
 package conf
 
 import (
+	"bufio"
 	"encoding/json"
+	"os"
+	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 
@@ -12,15 +16,22 @@ import (
 )
 
 type NameServerConfig struct {
-	Address       *Address
-	ClientIP      *Address
-	Port          uint16
-	SkipFallback  bool
-	Domains       []string
-	ExpectIPs     StringList
-	QueryStrategy string
+	Address       *Address   `json:"address"`
+	ClientIP      *Address   `json:"clientIp"`
+	Port          uint16     `json:"port"`
+	SkipFallback  bool       `json:"skipFallback"`
+	Domains       []string   `json:"domains"`
+	ExpectedIPs   StringList `json:"expectedIPs"`
+	ExpectIPs     StringList `json:"expectIPs"`
+	QueryStrategy string     `json:"queryStrategy"`
+	Tag           string     `json:"tag"`
+	TimeoutMs     uint64     `json:"timeoutMs"`
+	DisableCache  bool       `json:"disableCache"`
+	FinalQuery    bool       `json:"finalQuery"`
+	UnexpectedIPs StringList `json:"unexpectedIPs"`
 }
 
+// UnmarshalJSON implements encoding/json.Unmarshaler.UnmarshalJSON
 func (c *NameServerConfig) UnmarshalJSON(data []byte) error {
 	var address Address
 	if err := json.Unmarshal(data, &address); err == nil {
@@ -34,8 +45,14 @@ func (c *NameServerConfig) UnmarshalJSON(data []byte) error {
 		Port          uint16     `json:"port"`
 		SkipFallback  bool       `json:"skipFallback"`
 		Domains       []string   `json:"domains"`
-		ExpectIPs     StringList `json:"expectIps"`
+		ExpectedIPs   StringList `json:"expectedIPs"`
+		ExpectIPs     StringList `json:"expectIPs"`
 		QueryStrategy string     `json:"queryStrategy"`
+		Tag           string     `json:"tag"`
+		TimeoutMs     uint64     `json:"timeoutMs"`
+		DisableCache  bool       `json:"disableCache"`
+		FinalQuery    bool       `json:"finalQuery"`
+		UnexpectedIPs StringList `json:"unexpectedIPs"`
 	}
 	if err := json.Unmarshal(data, &advanced); err == nil {
 		c.Address = advanced.Address
@@ -43,8 +60,14 @@ func (c *NameServerConfig) UnmarshalJSON(data []byte) error {
 		c.Port = advanced.Port
 		c.SkipFallback = advanced.SkipFallback
 		c.Domains = advanced.Domains
+		c.ExpectedIPs = advanced.ExpectedIPs
 		c.ExpectIPs = advanced.ExpectIPs
 		c.QueryStrategy = advanced.QueryStrategy
+		c.Tag = advanced.Tag
+		c.TimeoutMs = advanced.TimeoutMs
+		c.DisableCache = advanced.DisableCache
+		c.FinalQuery = advanced.FinalQuery
+		c.UnexpectedIPs = advanced.UnexpectedIPs
 		return nil
 	}
 
@@ -92,9 +115,38 @@ func (c *NameServerConfig) Build() (*dns.NameServer, error) {
 		})
 	}
 
-	geoipList, err := ToCidrList(c.ExpectIPs)
+	if len(c.ExpectedIPs) == 0 {
+		c.ExpectedIPs = c.ExpectIPs
+	}
+
+	actPrior := false
+	var newExpectedIPs StringList
+	for _, s := range c.ExpectedIPs {
+		if s == "*" {
+			actPrior = true
+		} else {
+			newExpectedIPs = append(newExpectedIPs, s)
+		}
+	}
+
+	actUnprior := false
+	var newUnexpectedIPs StringList
+	for _, s := range c.UnexpectedIPs {
+		if s == "*" {
+			actUnprior = true
+		} else {
+			newUnexpectedIPs = append(newUnexpectedIPs, s)
+		}
+	}
+
+	expectedGeoipList, err := ToCidrList(newExpectedIPs)
 	if err != nil {
-		return nil, errors.New("invalid IP rule: ", c.ExpectIPs).Base(err)
+		return nil, errors.New("invalid expected IP rule: ", c.ExpectedIPs).Base(err)
+	}
+
+	unexpectedGeoipList, err := ToCidrList(newUnexpectedIPs)
+	if err != nil {
+		return nil, errors.New("invalid unexpected IP rule: ", c.UnexpectedIPs).Base(err)
 	}
 
 	var myClientIP []byte
@@ -114,9 +166,16 @@ func (c *NameServerConfig) Build() (*dns.NameServer, error) {
 		ClientIp:          myClientIP,
 		SkipFallback:      c.SkipFallback,
 		PrioritizedDomain: domains,
-		Geoip:             geoipList,
+		ExpectedGeoip:     expectedGeoipList,
 		OriginalRules:     originalRules,
 		QueryStrategy:     resolveQueryStrategy(c.QueryStrategy),
+		ActPrior:          actPrior,
+		Tag:               c.Tag,
+		TimeoutMs:         c.TimeoutMs,
+		DisableCache:      c.DisableCache,
+		FinalQuery:        c.FinalQuery,
+		UnexpectedGeoip:   unexpectedGeoipList,
+		ActUnprior:        actUnprior,
 	}, nil
 }
 
@@ -137,11 +196,24 @@ type DNSConfig struct {
 	DisableCache           bool                `json:"disableCache"`
 	DisableFallback        bool                `json:"disableFallback"`
 	DisableFallbackIfMatch bool                `json:"disableFallbackIfMatch"`
+	UseSystemHosts         bool                `json:"useSystemHosts"`
 }
 
 type HostAddress struct {
 	addr  *Address
 	addrs []*Address
+}
+
+// MarshalJSON implements encoding/json.Marshaler.MarshalJSON
+func (h *HostAddress) MarshalJSON() ([]byte, error) {
+	if (h.addr != nil) != (h.addrs != nil) {
+		if h.addr != nil {
+			return json.Marshal(h.addr)
+		} else if h.addrs != nil {
+			return json.Marshal(h.addrs)
+		}
+	}
+	return nil, errors.New("unexpected config state")
 }
 
 // UnmarshalJSON implements encoding/json.Unmarshaler.UnmarshalJSON
@@ -187,6 +259,11 @@ func getHostMapping(ha *HostAddress) *dns.Config_HostMapping {
 	return &dns.Config_HostMapping{
 		Ip: ips,
 	}
+}
+
+// MarshalJSON implements encoding/json.Marshaler.MarshalJSON
+func (m *HostsWrapper) MarshalJSON() ([]byte, error) {
+	return json.Marshal(m.Hosts)
 }
 
 // UnmarshalJSON implements encoding/json.Unmarshaler.UnmarshalJSON
@@ -341,6 +418,15 @@ func (c *DNSConfig) Build() (*dns.Config, error) {
 		}
 		config.StaticHosts = append(config.StaticHosts, staticHosts...)
 	}
+	if c.UseSystemHosts {
+		systemHosts, err := readSystemHosts()
+		if err != nil {
+			return nil, errors.New("failed to read system hosts").Base(err)
+		}
+		for domain, ips := range systemHosts {
+			config.StaticHosts = append(config.StaticHosts, &dns.Config_HostMapping{Ip: ips, Domain: domain, Type: dns.DomainMatchingType_Full})
+		}
+	}
 
 	return config, nil
 }
@@ -353,7 +439,57 @@ func resolveQueryStrategy(queryStrategy string) dns.QueryStrategy {
 		return dns.QueryStrategy_USE_IP4
 	case "useip6", "useipv6", "use_ip6", "use_ipv6", "use_ip_v6", "use-ip6", "use-ipv6", "use-ip-v6":
 		return dns.QueryStrategy_USE_IP6
+	case "usesys", "usesystem", "use_sys", "use_system", "use-sys", "use-system":
+		return dns.QueryStrategy_USE_SYS
 	default:
 		return dns.QueryStrategy_USE_IP
 	}
+}
+
+func readSystemHosts() (map[string][][]byte, error) {
+	var hostsPath string
+	switch runtime.GOOS {
+	case "windows":
+		hostsPath = filepath.Join(os.Getenv("SystemRoot"), "System32", "drivers", "etc", "hosts")
+	default:
+		hostsPath = "/etc/hosts"
+	}
+
+	file, err := os.Open(hostsPath)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	hostsMap := make(map[string][][]byte)
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if i := strings.IndexByte(line, '#'); i >= 0 {
+			// Discard comments.
+			line = line[0:i]
+		}
+		f := strings.Fields(line)
+		if len(f) < 2 {
+			continue
+		}
+		addr := net.ParseAddress(f[0])
+		if addr.Family().IsDomain() {
+			continue
+		}
+		ip := addr.IP()
+		for i := 1; i < len(f); i++ {
+			domain := strings.TrimSuffix(f[i], ".")
+			domain = strings.ToLower(domain)
+			if v, ok := hostsMap[domain]; ok {
+				hostsMap[domain] = append(v, ip)
+			} else {
+				hostsMap[domain] = [][]byte{ip}
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return hostsMap, nil
 }

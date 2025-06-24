@@ -13,8 +13,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/xtls/quic-go"
-	"github.com/xtls/quic-go/http3"
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
@@ -30,16 +30,6 @@ import (
 	"golang.org/x/net/http2"
 )
 
-// defines the maximum time an idle TCP session can survive in the tunnel, so
-// it should be consistent across HTTP versions and with other transports.
-const connIdleTimeout = 300 * time.Second
-
-// consistent with quic-go
-const quicgoH3KeepAlivePeriod = 10 * time.Second
-
-// consistent with chrome
-const chromeH2KeepAlivePeriod = 45 * time.Second
-
 type dialerConf struct {
 	net.Destination
 	*internet.MemoryStreamConfig
@@ -53,8 +43,8 @@ var (
 func getHTTPClient(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (DialerClient, *XmuxClient) {
 	realityConfig := reality.ConfigFromStreamSettings(streamSettings)
 
-	if browser_dialer.HasBrowserDialer() && realityConfig != nil {
-		return &BrowserDialerClient{}, nil
+	if browser_dialer.HasBrowserDialer() && realityConfig == nil {
+		return &BrowserDialerClient{transportConfig: streamSettings.ProtocolSettings.(*Config)}, nil
 	}
 
 	globalDialerAccess.Lock()
@@ -154,13 +144,13 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 
 	if httpVersion == "3" {
 		if keepAlivePeriod == 0 {
-			keepAlivePeriod = quicgoH3KeepAlivePeriod
+			keepAlivePeriod = net.QuicgoH3KeepAlivePeriod
 		}
 		if keepAlivePeriod < 0 {
 			keepAlivePeriod = 0
 		}
 		quicConfig := &quic.Config{
-			MaxIdleTimeout: connIdleTimeout,
+			MaxIdleTimeout: net.ConnIdleTimeout,
 
 			// these two are defaults of quic-go/http3. the default of quic-go (no
 			// http3) is different, so it is hardcoded here for clarity.
@@ -168,7 +158,7 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 			MaxIncomingStreams: -1,
 			KeepAlivePeriod:    keepAlivePeriod,
 		}
-		transport = &http3.RoundTripper{
+		transport = &http3.Transport{
 			QUICConfig:      quicConfig,
 			TLSClientConfig: gotlsConfig,
 			Dial: func(ctx context.Context, addr string, tlsCfg *gotls.Config, cfg *quic.Config) (quic.EarlyConnection, error) {
@@ -198,7 +188,7 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 						return nil, err
 					}
 				default:
-					udpConn = &internet.FakePacketConn{c}
+					udpConn = &internet.FakePacketConn{Conn: c}
 					udpAddr, err = net.ResolveUDPAddr("udp", c.RemoteAddr().String())
 					if err != nil {
 						return nil, err
@@ -210,7 +200,7 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 		}
 	} else if httpVersion == "2" {
 		if keepAlivePeriod == 0 {
-			keepAlivePeriod = chromeH2KeepAlivePeriod
+			keepAlivePeriod = net.ChromeH2KeepAlivePeriod
 		}
 		if keepAlivePeriod < 0 {
 			keepAlivePeriod = 0
@@ -219,7 +209,7 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 			DialTLSContext: func(ctxInner context.Context, network string, addr string, cfg *gotls.Config) (net.Conn, error) {
 				return dialContext(ctxInner)
 			},
-			IdleConnTimeout: connIdleTimeout,
+			IdleConnTimeout: net.ConnIdleTimeout,
 			ReadIdleTimeout: keepAlivePeriod,
 		}
 	} else {
@@ -230,7 +220,7 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 		transport = &http.Transport{
 			DialTLSContext:  httpDialContext,
 			DialContext:     httpDialContext,
-			IdleConnTimeout: connIdleTimeout,
+			IdleConnTimeout: net.ConnIdleTimeout,
 			// chunked transfer download with KeepAlives is buggy with
 			// http.Client and our custom dial context.
 			DisableKeepAlives: true,
@@ -291,11 +281,11 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 	mode := transportConfiguration.Mode
 	if mode == "" || mode == "auto" {
 		mode = "packet-up"
-		if httpVersion == "2" {
-			mode = "stream-up"
-		}
-		if realityConfig != nil && transportConfiguration.DownloadSettings == nil {
+		if realityConfig != nil {
 			mode = "stream-one"
+			if transportConfiguration.DownloadSettings != nil {
+				mode = "stream-up"
+			}
 		}
 	}
 
@@ -367,15 +357,18 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		},
 	}
 
+	var err error
 	if mode == "stream-one" {
 		requestURL.Path = transportConfiguration.GetNormalizedPath()
 		if xmuxClient != nil {
 			xmuxClient.LeftRequests.Add(-1)
 		}
-		conn.reader, conn.remoteAddr, conn.localAddr, _ = httpClient.OpenStream(ctx, requestURL.String(), reader, false)
+		conn.reader, conn.remoteAddr, conn.localAddr, err = httpClient.OpenStream(ctx, requestURL.String(), reader, false)
+		if err != nil { // browser dialer only
+			return nil, err
+		}
 		return stat.Connection(&conn), nil
 	} else { // stream-down
-		var err error
 		if xmuxClient2 != nil {
 			xmuxClient2.LeftRequests.Add(-1)
 		}
@@ -388,7 +381,10 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		if xmuxClient != nil {
 			xmuxClient.LeftRequests.Add(-1)
 		}
-		httpClient.OpenStream(ctx, requestURL.String(), reader, true)
+		_, _, _, err = httpClient.OpenStream(ctx, requestURL.String(), reader, true)
+		if err != nil { // browser dialer only
+			return nil, err
+		}
 		return stat.Connection(&conn), nil
 	}
 
@@ -428,8 +424,6 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 			// can reassign Path (potentially concurrently)
 			url := requestURL
 			url.Path += "/" + strconv.FormatInt(seq, 10)
-			// reassign query to get different padding
-			url.RawQuery = transportConfiguration.GetNormalizedQuery()
 
 			seq += 1
 

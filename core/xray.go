@@ -90,6 +90,11 @@ type Instance struct {
 	ctx context.Context
 }
 
+// Instance state
+func (server *Instance) IsRunning() bool {
+	return server.running
+}
+
 func AddInboundHandler(server *Instance, config *InboundHandlerConfig) error {
 	inboundManager := server.GetFeature(inbound.ManagerType()).(inbound.Manager)
 	rawHandler, err := CreateObject(server, config)
@@ -359,7 +364,7 @@ func (s *Instance) AddFeature(feature features.Feature) error {
 	}
 	s.pendingOptionalResolutions = pendingOptional
 	s.resolveLock.Unlock()
-	
+
 	var err error
 	for _, r := range availableResolution {
 		err = r.callbackResolution(s.features) // only return the last error for now
