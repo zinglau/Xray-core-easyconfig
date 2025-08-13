@@ -161,7 +161,7 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 		transport = &http3.Transport{
 			QUICConfig:      quicConfig,
 			TLSClientConfig: gotlsConfig,
-			Dial: func(ctx context.Context, addr string, tlsCfg *gotls.Config, cfg *quic.Config) (quic.EarlyConnection, error) {
+			Dial: func(ctx context.Context, addr string, tlsCfg *gotls.Config, cfg *quic.Config) (*quic.Conn, error) {
 				conn, err := internet.DialSystem(ctx, dest, streamSettings.SocketSettings)
 				if err != nil {
 					return nil, err
@@ -297,7 +297,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 	if transportConfiguration.DownloadSettings != nil {
 		globalDialerAccess.Lock()
 		if streamSettings.DownloadSettings == nil {
-			streamSettings.DownloadSettings = common.Must2(internet.ToMemoryStreamConfig(transportConfiguration.DownloadSettings)).(*internet.MemoryStreamConfig)
+			streamSettings.DownloadSettings = common.Must2(internet.ToMemoryStreamConfig(transportConfiguration.DownloadSettings))
 			if streamSettings.SocketSettings != nil && streamSettings.SocketSettings.Penetrate {
 				streamSettings.DownloadSettings.SocketSettings = streamSettings.SocketSettings
 			}
