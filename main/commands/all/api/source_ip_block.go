@@ -93,7 +93,6 @@ func executeSourceIpBlock(cmd *base.Command, args []string) {
 				"ruleTag" : "%s",
 				"inboundTag": %s,		
 				"outboundTag": "%s",
-				"type": "field",
 				"source": %s
 			  }
 			]
@@ -137,5 +136,4 @@ func executeSourceIpBlock(cmd *base.Command, args []string) {
 		base.Fatalf("failed to perform AddRule: %s", err)
 	}
 	showJSONResponse(resp)
-
 }

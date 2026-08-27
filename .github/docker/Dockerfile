@@ -6,7 +6,7 @@ WORKDIR /src
 COPY . .
 ARG TARGETOS
 ARG TARGETARCH
-RUN GOOS=$TARGETOS GOARCH=$TARGETARCH CGO_ENABLED=0 go build -o xray -trimpath -ldflags "-s -w -buildid=" ./main
+RUN GOOS=$TARGETOS GOARCH=$TARGETARCH CGO_ENABLED=0 go build -o xray -trimpath -buildvcs=false -gcflags="all=-l=4" -ldflags "-s -w -buildid=" ./main
 
 # Download geodat into a staging directory
 ADD https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/geoip.dat /tmp/geodat/geoip.dat
@@ -32,9 +32,13 @@ RUN echo '{}' >/tmp/usr/local/etc/xray/03_routing.json
 RUN echo '{}' >/tmp/usr/local/etc/xray/04_policy.json
 RUN echo '{}' >/tmp/usr/local/etc/xray/05_inbounds.json
 RUN echo '{}' >/tmp/usr/local/etc/xray/06_outbounds.json
-RUN echo '{}' >/tmp/usr/local/etc/xray/07_transport.json
-RUN echo '{}' >/tmp/usr/local/etc/xray/08_stats.json
-RUN echo '{}' >/tmp/usr/local/etc/xray/09_reverse.json
+RUN echo '{}' >/tmp/usr/local/etc/xray/07_stats.json
+RUN echo '{}' >/tmp/usr/local/etc/xray/08_fakedns.json
+RUN echo '{}' >/tmp/usr/local/etc/xray/09_metrics.json
+RUN echo '{}' >/tmp/usr/local/etc/xray/10_observatory.json
+RUN echo '{}' >/tmp/usr/local/etc/xray/11_geodata.json
+RUN echo '{}' >/tmp/usr/local/etc/xray/12_env.json
+RUN echo '{}' >/tmp/usr/local/etc/xray/99_version.json
 
 # Create log files
 RUN mkdir -p /tmp/var/log/xray && touch \
@@ -45,8 +49,8 @@ RUN mkdir -p /tmp/var/log/xray && touch \
 FROM gcr.io/distroless/static:nonroot
 
 COPY --from=build --chown=0:0 --chmod=755 /src/xray /usr/local/bin/xray
-COPY --from=build --chown=0:0 --chmod=755 /tmp/empty /usr/local/share/xray
-COPY --from=build --chown=0:0 --chmod=644 /tmp/geodat/*.dat /usr/local/share/xray/
+COPY --from=build --chown=65532:65532 --chmod=755 /tmp/empty /usr/local/share/xray
+COPY --from=build --chown=65532:65532 --chmod=644 /tmp/geodat/*.dat /usr/local/share/xray/
 COPY --from=build --chown=0:0 --chmod=755 /tmp/empty /usr/local/etc/xray
 COPY --from=build --chown=0:0 --chmod=644 /tmp/usr/local/etc/xray/*.json /usr/local/etc/xray/
 COPY --from=build --chown=0:0 --chmod=755 /tmp/empty /var/log/xray

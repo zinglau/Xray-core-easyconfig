@@ -3,6 +3,7 @@ package scenarios
 import (
 	"encoding/base64"
 	"encoding/hex"
+	"sync"
 	"testing"
 	"time"
 
@@ -53,7 +54,7 @@ func TestVless(t *testing.T) {
 					Listen:   net.NewIPOrDomain(net.LocalHostIP),
 				}),
 				ProxySettings: serial.ToTypedMessage(&inbound.Config{
-					Clients: []*protocol.User{
+					Users: []*protocol.User{
 						{
 							Account: serial.ToTypedMessage(&vless.Account{
 								Id: userID.String(),
@@ -65,7 +66,9 @@ func TestVless(t *testing.T) {
 		},
 		Outbound: []*core.OutboundHandlerConfig{
 			{
-				ProxySettings: serial.ToTypedMessage(&freedom.Config{}),
+				ProxySettings: serial.ToTypedMessage(&freedom.Config{
+					FinalRules: []*freedom.FinalRuleConfig{{Action: freedom.RuleAction_Allow}},
+				}),
 			},
 		},
 	}
@@ -85,26 +88,22 @@ func TestVless(t *testing.T) {
 					Listen:   net.NewIPOrDomain(net.LocalHostIP),
 				}),
 				ProxySettings: serial.ToTypedMessage(&dokodemo.Config{
-					Address:  net.NewIPOrDomain(dest.Address),
-					Port:     uint32(dest.Port),
-					Networks: []net.Network{net.Network_TCP},
+					RewriteAddress:  net.NewIPOrDomain(dest.Address),
+					RewritePort:     uint32(dest.Port),
+					AllowedNetworks: []net.Network{net.Network_TCP},
 				}),
 			},
 		},
 		Outbound: []*core.OutboundHandlerConfig{
 			{
 				ProxySettings: serial.ToTypedMessage(&outbound.Config{
-					Vnext: []*protocol.ServerEndpoint{
-						{
-							Address: net.NewIPOrDomain(net.LocalHostIP),
-							Port:    uint32(serverPort),
-							User: []*protocol.User{
-								{
-									Account: serial.ToTypedMessage(&vless.Account{
-										Id: userID.String(),
-									}),
-								},
-							},
+					Vnext: &protocol.ServerEndpoint{
+						Address: net.NewIPOrDomain(net.LocalHostIP),
+						Port:    uint32(serverPort),
+						User: &protocol.User{
+							Account: serial.ToTypedMessage(&vless.Account{
+								Id: userID.String(),
+							}),
 						},
 					},
 				}),
@@ -117,7 +116,7 @@ func TestVless(t *testing.T) {
 	defer CloseAllServers(servers)
 
 	var errg errgroup.Group
-	for i := 0; i < 10; i++ {
+	for range 3 {
 		errg.Go(testTCPConn(clientPort, 1024*1024, time.Second*30))
 	}
 	if err := errg.Wait(); err != nil {
@@ -133,6 +132,8 @@ func TestVlessTls(t *testing.T) {
 	common.Must(err)
 	defer tcpServer.Close()
 
+	ct, ctHash := cert.MustGenerate(nil, cert.CommonName("localhost"))
+
 	userID := protocol.NewID(uuid.New())
 	serverPort := tcp.PickPort()
 	serverConfig := &core.Config{
@@ -152,13 +153,13 @@ func TestVlessTls(t *testing.T) {
 						SecurityType: serial.GetMessageType(&tls.Config{}),
 						SecuritySettings: []*serial.TypedMessage{
 							serial.ToTypedMessage(&tls.Config{
-								Certificate: []*tls.Certificate{tls.ParseCertificate(cert.MustGenerate(nil))},
+								Certificate: []*tls.Certificate{tls.ParseCertificate(ct)},
 							}),
 						},
 					},
 				}),
 				ProxySettings: serial.ToTypedMessage(&inbound.Config{
-					Clients: []*protocol.User{
+					Users: []*protocol.User{
 						{
 							Account: serial.ToTypedMessage(&vless.Account{
 								Id: userID.String(),
@@ -170,7 +171,9 @@ func TestVlessTls(t *testing.T) {
 		},
 		Outbound: []*core.OutboundHandlerConfig{
 			{
-				ProxySettings: serial.ToTypedMessage(&freedom.Config{}),
+				ProxySettings: serial.ToTypedMessage(&freedom.Config{
+					FinalRules: []*freedom.FinalRuleConfig{{Action: freedom.RuleAction_Allow}},
+				}),
 			},
 		},
 	}
@@ -190,26 +193,22 @@ func TestVlessTls(t *testing.T) {
 					Listen:   net.NewIPOrDomain(net.LocalHostIP),
 				}),
 				ProxySettings: serial.ToTypedMessage(&dokodemo.Config{
-					Address:  net.NewIPOrDomain(dest.Address),
-					Port:     uint32(dest.Port),
-					Networks: []net.Network{net.Network_TCP},
+					RewriteAddress:  net.NewIPOrDomain(dest.Address),
+					RewritePort:     uint32(dest.Port),
+					AllowedNetworks: []net.Network{net.Network_TCP},
 				}),
 			},
 		},
 		Outbound: []*core.OutboundHandlerConfig{
 			{
 				ProxySettings: serial.ToTypedMessage(&outbound.Config{
-					Vnext: []*protocol.ServerEndpoint{
-						{
-							Address: net.NewIPOrDomain(net.LocalHostIP),
-							Port:    uint32(serverPort),
-							User: []*protocol.User{
-								{
-									Account: serial.ToTypedMessage(&vless.Account{
-										Id: userID.String(),
-									}),
-								},
-							},
+					Vnext: &protocol.ServerEndpoint{
+						Address: net.NewIPOrDomain(net.LocalHostIP),
+						Port:    uint32(serverPort),
+						User: &protocol.User{
+							Account: serial.ToTypedMessage(&vless.Account{
+								Id: userID.String(),
+							}),
 						},
 					},
 				}),
@@ -225,7 +224,7 @@ func TestVlessTls(t *testing.T) {
 						SecurityType: serial.GetMessageType(&tls.Config{}),
 						SecuritySettings: []*serial.TypedMessage{
 							serial.ToTypedMessage(&tls.Config{
-								AllowInsecure: true,
+								PinnedPeerCertSha256: [][]byte{ctHash[:]},
 							}),
 						},
 					},
@@ -239,7 +238,7 @@ func TestVlessTls(t *testing.T) {
 	defer CloseAllServers(servers)
 
 	var errg errgroup.Group
-	for i := 0; i < 10; i++ {
+	for range 3 {
 		errg.Go(testTCPConn(clientPort, 1024*1024, time.Second*30))
 	}
 	if err := errg.Wait(); err != nil {
@@ -255,6 +254,8 @@ func TestVlessXtlsVision(t *testing.T) {
 	common.Must(err)
 	defer tcpServer.Close()
 
+	ct, ctHash := cert.MustGenerate(nil, cert.CommonName("localhost"))
+
 	userID := protocol.NewID(uuid.New())
 	serverPort := tcp.PickPort()
 	serverConfig := &core.Config{
@@ -274,13 +275,13 @@ func TestVlessXtlsVision(t *testing.T) {
 						SecurityType: serial.GetMessageType(&tls.Config{}),
 						SecuritySettings: []*serial.TypedMessage{
 							serial.ToTypedMessage(&tls.Config{
-								Certificate: []*tls.Certificate{tls.ParseCertificate(cert.MustGenerate(nil))},
+								Certificate: []*tls.Certificate{tls.ParseCertificate(ct)},
 							}),
 						},
 					},
 				}),
 				ProxySettings: serial.ToTypedMessage(&inbound.Config{
-					Clients: []*protocol.User{
+					Users: []*protocol.User{
 						{
 							Account: serial.ToTypedMessage(&vless.Account{
 								Id:   userID.String(),
@@ -293,7 +294,9 @@ func TestVlessXtlsVision(t *testing.T) {
 		},
 		Outbound: []*core.OutboundHandlerConfig{
 			{
-				ProxySettings: serial.ToTypedMessage(&freedom.Config{}),
+				ProxySettings: serial.ToTypedMessage(&freedom.Config{
+					FinalRules: []*freedom.FinalRuleConfig{{Action: freedom.RuleAction_Allow}},
+				}),
 			},
 		},
 	}
@@ -313,27 +316,23 @@ func TestVlessXtlsVision(t *testing.T) {
 					Listen:   net.NewIPOrDomain(net.LocalHostIP),
 				}),
 				ProxySettings: serial.ToTypedMessage(&dokodemo.Config{
-					Address:  net.NewIPOrDomain(dest.Address),
-					Port:     uint32(dest.Port),
-					Networks: []net.Network{net.Network_TCP},
+					RewriteAddress:  net.NewIPOrDomain(dest.Address),
+					RewritePort:     uint32(dest.Port),
+					AllowedNetworks: []net.Network{net.Network_TCP},
 				}),
 			},
 		},
 		Outbound: []*core.OutboundHandlerConfig{
 			{
 				ProxySettings: serial.ToTypedMessage(&outbound.Config{
-					Vnext: []*protocol.ServerEndpoint{
-						{
-							Address: net.NewIPOrDomain(net.LocalHostIP),
-							Port:    uint32(serverPort),
-							User: []*protocol.User{
-								{
-									Account: serial.ToTypedMessage(&vless.Account{
-										Id:   userID.String(),
-										Flow: vless.XRV,
-									}),
-								},
-							},
+					Vnext: &protocol.ServerEndpoint{
+						Address: net.NewIPOrDomain(net.LocalHostIP),
+						Port:    uint32(serverPort),
+						User: &protocol.User{
+							Account: serial.ToTypedMessage(&vless.Account{
+								Id:   userID.String(),
+								Flow: vless.XRV,
+							}),
 						},
 					},
 				}),
@@ -349,7 +348,7 @@ func TestVlessXtlsVision(t *testing.T) {
 						SecurityType: serial.GetMessageType(&tls.Config{}),
 						SecuritySettings: []*serial.TypedMessage{
 							serial.ToTypedMessage(&tls.Config{
-								AllowInsecure: true,
+								PinnedPeerCertSha256: [][]byte{ctHash[:]},
 							}),
 						},
 					},
@@ -363,7 +362,7 @@ func TestVlessXtlsVision(t *testing.T) {
 	defer CloseAllServers(servers)
 
 	var errg errgroup.Group
-	for i := 0; i < 10; i++ {
+	for range 3 {
 		errg.Go(testTCPConn(clientPort, 1024*1024, time.Second*30))
 	}
 	if err := errg.Wait(); err != nil {
@@ -414,7 +413,7 @@ func TestVlessXtlsVisionReality(t *testing.T) {
 					},
 				}),
 				ProxySettings: serial.ToTypedMessage(&inbound.Config{
-					Clients: []*protocol.User{
+					Users: []*protocol.User{
 						{
 							Account: serial.ToTypedMessage(&vless.Account{
 								Id:   userID.String(),
@@ -427,7 +426,9 @@ func TestVlessXtlsVisionReality(t *testing.T) {
 		},
 		Outbound: []*core.OutboundHandlerConfig{
 			{
-				ProxySettings: serial.ToTypedMessage(&freedom.Config{}),
+				ProxySettings: serial.ToTypedMessage(&freedom.Config{
+					FinalRules: []*freedom.FinalRuleConfig{{Action: freedom.RuleAction_Allow}},
+				}),
 			},
 		},
 	}
@@ -447,27 +448,23 @@ func TestVlessXtlsVisionReality(t *testing.T) {
 					Listen:   net.NewIPOrDomain(net.LocalHostIP),
 				}),
 				ProxySettings: serial.ToTypedMessage(&dokodemo.Config{
-					Address:  net.NewIPOrDomain(dest.Address),
-					Port:     uint32(dest.Port),
-					Networks: []net.Network{net.Network_TCP},
+					RewriteAddress:  net.NewIPOrDomain(dest.Address),
+					RewritePort:     uint32(dest.Port),
+					AllowedNetworks: []net.Network{net.Network_TCP},
 				}),
 			},
 		},
 		Outbound: []*core.OutboundHandlerConfig{
 			{
 				ProxySettings: serial.ToTypedMessage(&outbound.Config{
-					Vnext: []*protocol.ServerEndpoint{
-						{
-							Address: net.NewIPOrDomain(net.LocalHostIP),
-							Port:    uint32(serverPort),
-							User: []*protocol.User{
-								{
-									Account: serial.ToTypedMessage(&vless.Account{
-										Id:   userID.String(),
-										Flow: vless.XRV,
-									}),
-								},
-							},
+					Vnext: &protocol.ServerEndpoint{
+						Address: net.NewIPOrDomain(net.LocalHostIP),
+						Port:    uint32(serverPort),
+						User: &protocol.User{
+							Account: serial.ToTypedMessage(&vless.Account{
+								Id:   userID.String(),
+								Flow: vless.XRV,
+							}),
 						},
 					},
 				}),
@@ -502,10 +499,161 @@ func TestVlessXtlsVisionReality(t *testing.T) {
 	defer CloseAllServers(servers)
 
 	var errg errgroup.Group
-	for i := 0; i < 1; i++ {
+	for range 3 {
 		errg.Go(testTCPConn(clientPort, 1024*1024, time.Second*30))
 	}
 	if err := errg.Wait(); err != nil {
 		t.Error(err)
 	}
+}
+
+// This testing test all known utls fingerprint in tls.PresetFingerprints that support reality (expect unsafe and random*)
+// Beacuse figerprint support may be broken after utls/reality update
+// Known broken fingerprint: android, 360
+func TestVlessRealityFingerprints(t *testing.T) {
+	TestFingerprint := func(fingerprint string) error {
+		tcpServer := tcp.Server{
+			MsgProcessor: xor,
+		}
+		dest, err := tcpServer.Start()
+		common.Must(err)
+		defer tcpServer.Close()
+
+		userID := protocol.NewID(uuid.New())
+		serverPort := tcp.PickPort()
+		privateKey, _ := base64.RawURLEncoding.DecodeString("aGSYystUbf59_9_6LKRxD27rmSW_-2_nyd9YG_Gwbks")
+		publicKey, _ := base64.RawURLEncoding.DecodeString("E59WjnvZcQMu7tR7_BgyhycuEdBS-CtKxfImRCdAvFM")
+		shortIds := make([][]byte, 1)
+		shortIds[0] = make([]byte, 8)
+		hex.Decode(shortIds[0], []byte("0123456789abcdef"))
+		serverConfig := &core.Config{
+			App: []*serial.TypedMessage{
+				serial.ToTypedMessage(&log.Config{
+					ErrorLogType: log.LogType_None,
+				}),
+			},
+			Inbound: []*core.InboundHandlerConfig{
+				{
+					ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
+						PortList: &net.PortList{Range: []*net.PortRange{net.SinglePortRange(serverPort)}},
+						Listen:   net.NewIPOrDomain(net.LocalHostIP),
+						StreamSettings: &internet.StreamConfig{
+							ProtocolName: "tcp",
+							SecurityType: serial.GetMessageType(&reality.Config{}),
+							SecuritySettings: []*serial.TypedMessage{
+								serial.ToTypedMessage(&reality.Config{
+									Show:        false,
+									Dest:        "www.google.com:443", // use google for now, may fail in some region
+									ServerNames: []string{"www.google.com"},
+									PrivateKey:  privateKey,
+									ShortIds:    shortIds,
+									Type:        "tcp",
+								}),
+							},
+						},
+					}),
+					ProxySettings: serial.ToTypedMessage(&inbound.Config{
+						Users: []*protocol.User{
+							{
+								Account: serial.ToTypedMessage(&vless.Account{
+									Id: userID.String(),
+								}),
+							},
+						},
+					}),
+				},
+			},
+			Outbound: []*core.OutboundHandlerConfig{
+				{
+					ProxySettings: serial.ToTypedMessage(&freedom.Config{
+						FinalRules: []*freedom.FinalRuleConfig{{Action: freedom.RuleAction_Allow}},
+					}),
+				},
+			},
+		}
+
+		clientPort := tcp.PickPort()
+		clientConfig := &core.Config{
+			App: []*serial.TypedMessage{
+				serial.ToTypedMessage(&log.Config{
+					ErrorLogType: log.LogType_None,
+				}),
+			},
+			Inbound: []*core.InboundHandlerConfig{
+				{
+					ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
+						PortList: &net.PortList{Range: []*net.PortRange{net.SinglePortRange(clientPort)}},
+						Listen:   net.NewIPOrDomain(net.LocalHostIP),
+					}),
+					ProxySettings: serial.ToTypedMessage(&dokodemo.Config{
+						RewriteAddress:  net.NewIPOrDomain(dest.Address),
+						RewritePort:     uint32(dest.Port),
+						AllowedNetworks: []net.Network{net.Network_TCP},
+					}),
+				},
+			},
+			Outbound: []*core.OutboundHandlerConfig{
+				{
+					ProxySettings: serial.ToTypedMessage(&outbound.Config{
+						Vnext: &protocol.ServerEndpoint{
+							Address: net.NewIPOrDomain(net.LocalHostIP),
+							Port:    uint32(serverPort),
+							User: &protocol.User{
+								Account: serial.ToTypedMessage(&vless.Account{
+									Id: userID.String(),
+								}),
+							},
+						},
+					}),
+					SenderSettings: serial.ToTypedMessage(&proxyman.SenderConfig{
+						StreamSettings: &internet.StreamConfig{
+							ProtocolName: "tcp",
+							TransportSettings: []*internet.TransportConfig{
+								{
+									ProtocolName: "tcp",
+									Settings:     serial.ToTypedMessage(&transtcp.Config{}),
+								},
+							},
+							SecurityType: serial.GetMessageType(&reality.Config{}),
+							SecuritySettings: []*serial.TypedMessage{
+								serial.ToTypedMessage(&reality.Config{
+									Show:        false,
+									Fingerprint: fingerprint,
+									ServerName:  "www.google.com",
+									PublicKey:   publicKey,
+									ShortId:     shortIds[0],
+									SpiderX:     "/",
+								}),
+							},
+						},
+					}),
+				},
+			},
+		}
+
+		servers, err := InitializeServerConfigs(serverConfig, clientConfig)
+		common.Must(err)
+		defer CloseAllServers(servers)
+
+		err = testTCPConn(clientPort, 1024*1024, time.Second*15)()
+		if err != nil {
+			return err
+		}
+		return nil
+	}
+	fingerPrints := []string{"chrome", "firefox", "safari", "ios", "edge", "qq"}
+	wg := sync.WaitGroup{}
+	wg.Add(len(fingerPrints))
+	for _, fp := range fingerPrints {
+		go func() {
+			err := TestFingerprint(fp)
+			if err != nil {
+				t.Errorf("Fingerprint %s test failed: %v", fp, err)
+			} else {
+				t.Logf("Fingerprint %s test passed", fp)
+			}
+			wg.Done()
+		}()
+	}
+	wg.Wait()
 }

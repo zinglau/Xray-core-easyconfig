@@ -34,7 +34,6 @@ func (ctx *Context) GetSourceIPs() []net.IP {
 	}
 
 	return nil
-
 }
 
 // GetSourcePort implements routing.Context.
@@ -142,6 +141,14 @@ func (ctx *Context) GetUser() string {
 		return ""
 	}
 	return ctx.Inbound.User.Email
+}
+
+// GetVlessRoute implements routing.Context.
+func (ctx *Context) GetVlessRoute() net.Port {
+	if ctx.Inbound == nil {
+		return 0
+	}
+	return ctx.Inbound.VlessRoute
 }
 
 // GetAttributes implements routing.Context.

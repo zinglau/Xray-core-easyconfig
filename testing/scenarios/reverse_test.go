@@ -10,6 +10,7 @@ import (
 	"github.com/xtls/xray-core/app/reverse"
 	"github.com/xtls/xray-core/app/router"
 	"github.com/xtls/xray-core/common"
+	"github.com/xtls/xray-core/common/geodata"
 	clog "github.com/xtls/xray-core/common/log"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
@@ -52,8 +53,8 @@ func TestReverseProxy(t *testing.T) {
 			serial.ToTypedMessage(&router.Config{
 				Rule: []*router.RoutingRule{
 					{
-						Domain: []*router.Domain{
-							{Type: router.Domain_Full, Value: "test.example.com"},
+						Domain: []*geodata.DomainRule{
+							{Value: &geodata.DomainRule_Custom{Custom: &geodata.Domain{Type: geodata.Domain_Full, Value: "test.example.com"}}},
 						},
 						TargetTag: &router.RoutingRule_Tag{
 							Tag: "portal",
@@ -76,9 +77,9 @@ func TestReverseProxy(t *testing.T) {
 					Listen:   net.NewIPOrDomain(net.LocalHostIP),
 				}),
 				ProxySettings: serial.ToTypedMessage(&dokodemo.Config{
-					Address:  net.NewIPOrDomain(dest.Address),
-					Port:     uint32(dest.Port),
-					Networks: []net.Network{net.Network_TCP},
+					RewriteAddress:  net.NewIPOrDomain(dest.Address),
+					RewritePort:     uint32(dest.Port),
+					AllowedNetworks: []net.Network{net.Network_TCP},
 				}),
 			},
 			{
@@ -118,8 +119,8 @@ func TestReverseProxy(t *testing.T) {
 			serial.ToTypedMessage(&router.Config{
 				Rule: []*router.RoutingRule{
 					{
-						Domain: []*router.Domain{
-							{Type: router.Domain_Full, Value: "test.example.com"},
+						Domain: []*geodata.DomainRule{
+							{Value: &geodata.DomainRule_Custom{Custom: &geodata.Domain{Type: geodata.Domain_Full, Value: "test.example.com"}}},
 						},
 						TargetTag: &router.RoutingRule_Tag{
 							Tag: "reverse",
@@ -141,34 +142,30 @@ func TestReverseProxy(t *testing.T) {
 					Listen:   net.NewIPOrDomain(net.LocalHostIP),
 				}),
 				ProxySettings: serial.ToTypedMessage(&dokodemo.Config{
-					Address:  net.NewIPOrDomain(dest.Address),
-					Port:     uint32(dest.Port),
-					Networks: []net.Network{net.Network_TCP},
+					RewriteAddress:  net.NewIPOrDomain(dest.Address),
+					RewritePort:     uint32(dest.Port),
+					AllowedNetworks: []net.Network{net.Network_TCP},
 				}),
 			},
 		},
 		Outbound: []*core.OutboundHandlerConfig{
 			{
 				Tag:           "freedom",
-				ProxySettings: serial.ToTypedMessage(&freedom.Config{}),
+				ProxySettings: serial.ToTypedMessage(&freedom.Config{FinalRules: []*freedom.FinalRuleConfig{{Action: freedom.RuleAction_Allow}}}),
 			},
 			{
 				Tag: "reverse",
 				ProxySettings: serial.ToTypedMessage(&outbound.Config{
-					Receiver: []*protocol.ServerEndpoint{
-						{
-							Address: net.NewIPOrDomain(net.LocalHostIP),
-							Port:    uint32(reversePort),
-							User: []*protocol.User{
-								{
-									Account: serial.ToTypedMessage(&vmess.Account{
-										Id: userID.String(),
-										SecuritySettings: &protocol.SecurityConfig{
-											Type: protocol.SecurityType_AES128_GCM,
-										},
-									}),
+					Receiver: &protocol.ServerEndpoint{
+						Address: net.NewIPOrDomain(net.LocalHostIP),
+						Port:    uint32(reversePort),
+						User: &protocol.User{
+							Account: serial.ToTypedMessage(&vmess.Account{
+								Id: userID.String(),
+								SecuritySettings: &protocol.SecurityConfig{
+									Type: protocol.SecurityType_AES128_GCM,
 								},
-							},
+							}),
 						},
 					},
 				}),
@@ -182,7 +179,7 @@ func TestReverseProxy(t *testing.T) {
 	defer CloseAllServers(servers)
 
 	var errg errgroup.Group
-	for i := 0; i < 32; i++ {
+	for range 32 {
 		errg.Go(testTCPConn(externalPort, 10240*1024, time.Second*40))
 	}
 
@@ -231,8 +228,8 @@ func TestReverseProxyLongRunning(t *testing.T) {
 			serial.ToTypedMessage(&router.Config{
 				Rule: []*router.RoutingRule{
 					{
-						Domain: []*router.Domain{
-							{Type: router.Domain_Full, Value: "test.example.com"},
+						Domain: []*geodata.DomainRule{
+							{Value: &geodata.DomainRule_Custom{Custom: &geodata.Domain{Type: geodata.Domain_Full, Value: "test.example.com"}}},
 						},
 						TargetTag: &router.RoutingRule_Tag{
 							Tag: "portal",
@@ -255,9 +252,9 @@ func TestReverseProxyLongRunning(t *testing.T) {
 					Listen:   net.NewIPOrDomain(net.LocalHostIP),
 				}),
 				ProxySettings: serial.ToTypedMessage(&dokodemo.Config{
-					Address:  net.NewIPOrDomain(dest.Address),
-					Port:     uint32(dest.Port),
-					Networks: []net.Network{net.Network_TCP},
+					RewriteAddress:  net.NewIPOrDomain(dest.Address),
+					RewritePort:     uint32(dest.Port),
+					AllowedNetworks: []net.Network{net.Network_TCP},
 				}),
 			},
 			{
@@ -311,8 +308,8 @@ func TestReverseProxyLongRunning(t *testing.T) {
 			serial.ToTypedMessage(&router.Config{
 				Rule: []*router.RoutingRule{
 					{
-						Domain: []*router.Domain{
-							{Type: router.Domain_Full, Value: "test.example.com"},
+						Domain: []*geodata.DomainRule{
+							{Value: &geodata.DomainRule_Custom{Custom: &geodata.Domain{Type: geodata.Domain_Full, Value: "test.example.com"}}},
 						},
 						TargetTag: &router.RoutingRule_Tag{
 							Tag: "reverse",
@@ -334,34 +331,30 @@ func TestReverseProxyLongRunning(t *testing.T) {
 					Listen:   net.NewIPOrDomain(net.LocalHostIP),
 				}),
 				ProxySettings: serial.ToTypedMessage(&dokodemo.Config{
-					Address:  net.NewIPOrDomain(dest.Address),
-					Port:     uint32(dest.Port),
-					Networks: []net.Network{net.Network_TCP},
+					RewriteAddress:  net.NewIPOrDomain(dest.Address),
+					RewritePort:     uint32(dest.Port),
+					AllowedNetworks: []net.Network{net.Network_TCP},
 				}),
 			},
 		},
 		Outbound: []*core.OutboundHandlerConfig{
 			{
 				Tag:           "freedom",
-				ProxySettings: serial.ToTypedMessage(&freedom.Config{}),
+				ProxySettings: serial.ToTypedMessage(&freedom.Config{FinalRules: []*freedom.FinalRuleConfig{{Action: freedom.RuleAction_Allow}}}),
 			},
 			{
 				Tag: "reverse",
 				ProxySettings: serial.ToTypedMessage(&outbound.Config{
-					Receiver: []*protocol.ServerEndpoint{
-						{
-							Address: net.NewIPOrDomain(net.LocalHostIP),
-							Port:    uint32(reversePort),
-							User: []*protocol.User{
-								{
-									Account: serial.ToTypedMessage(&vmess.Account{
-										Id: userID.String(),
-										SecuritySettings: &protocol.SecurityConfig{
-											Type: protocol.SecurityType_AES128_GCM,
-										},
-									}),
+					Receiver: &protocol.ServerEndpoint{
+						Address: net.NewIPOrDomain(net.LocalHostIP),
+						Port:    uint32(reversePort),
+						User: &protocol.User{
+							Account: serial.ToTypedMessage(&vmess.Account{
+								Id: userID.String(),
+								SecuritySettings: &protocol.SecurityConfig{
+									Type: protocol.SecurityType_AES128_GCM,
 								},
-							},
+							}),
 						},
 					},
 				}),
@@ -374,7 +367,7 @@ func TestReverseProxyLongRunning(t *testing.T) {
 
 	defer CloseAllServers(servers)
 
-	for i := 0; i < 4096; i++ {
+	for range 4096 {
 		if err := testTCPConn(externalPort, 1024, time.Second*20)(); err != nil {
 			t.Error(err)
 		}

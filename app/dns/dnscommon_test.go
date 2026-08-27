@@ -2,6 +2,7 @@ package dns
 
 import (
 	"math/rand"
+	"strings"
 	"testing"
 	"time"
 
@@ -24,7 +25,8 @@ func Test_parseResponse(t *testing.T) {
 
 	ans = new(dns.Msg)
 	ans.Id = 1
-	ans.Answer = append(ans.Answer,
+	ans.Answer = append(
+		ans.Answer,
 		common.Must2(dns.NewRR("google.com. IN CNAME m.test.google.com")),
 		common.Must2(dns.NewRR("google.com. IN CNAME fake.google.com")),
 		common.Must2(dns.NewRR("google.com. IN A 8.8.8.8")),
@@ -34,13 +36,14 @@ func Test_parseResponse(t *testing.T) {
 
 	ans = new(dns.Msg)
 	ans.Id = 2
-	ans.Answer = append(ans.Answer,
+	ans.Answer = append(
+		ans.Answer,
 		common.Must2(dns.NewRR("google.com. IN CNAME m.test.google.com")),
 		common.Must2(dns.NewRR("google.com. IN CNAME fake.google.com")),
 		common.Must2(dns.NewRR("google.com. IN CNAME m.test.google.com")),
 		common.Must2(dns.NewRR("google.com. IN CNAME test.google.com")),
-		common.Must2(dns.NewRR("google.com. IN AAAA 2001::123:8888")),
-		common.Must2(dns.NewRR("google.com. IN AAAA 2001::123:8844")),
+		common.Must2(dns.NewRR("google.com. IN AAAA 2001:4860:4860::8888")),
+		common.Must2(dns.NewRR("google.com. IN AAAA 2001:4860:4860::8844")),
 	)
 	p = append(p, common.Must2(ans.Pack()))
 
@@ -72,7 +75,7 @@ func Test_parseResponse(t *testing.T) {
 		},
 		{
 			"aaaa record",
-			&IPRecord{2, []net.IP{net.ParseIP("2001::123:8888"), net.ParseIP("2001::123:8844")}, time.Time{}, dnsmessage.RCodeSuccess, nil},
+			&IPRecord{2, []net.IP{net.ParseIP("2001:4860:4860::8888"), net.ParseIP("2001:4860:4860::8844")}, time.Time{}, dnsmessage.RCodeSuccess, nil},
 			false,
 		},
 	}
@@ -131,10 +134,15 @@ func Test_buildReqMsgs(t *testing.T) {
 			IPv6Enable: false,
 			FakeEnable: false,
 		}, nil}, 0},
+		{"name too long", args{strings.Repeat("a", 256), dns_feature.IPOption{
+			IPv4Enable: true,
+			IPv6Enable: true,
+			FakeEnable: false,
+		}, nil}, 0},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := buildReqMsgs(tt.args.domain, tt.args.option, stubID, tt.args.reqOpts); !(len(got) == tt.want) {
+			if got, _ := buildReqMsgs(tt.args.domain, tt.args.option, stubID, tt.args.reqOpts); !(len(got) == tt.want) {
 				t.Errorf("buildReqMsgs() = %v, want %v", got, tt.want)
 			}
 		})
