@@ -2,8 +2,10 @@ package internet
 
 import (
 	"context"
-	"github.com/xtls/xray-core/common/net"
 	"time"
+
+	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/net"
 )
 
 type result struct {
@@ -12,7 +14,7 @@ type result struct {
 	index int
 }
 
-func TcpRaceDial(ctx context.Context, src net.Address, ips []net.IP, port net.Port, sockopt *SocketConfig) (net.Conn, error) {
+func TcpRaceDial(ctx context.Context, src net.Address, ips []net.IP, port net.Port, sockopt *SocketConfig, domain string) (net.Conn, error) {
 	if len(ips) < 2 {
 		panic("at least 2 ips is required to race dial")
 	}
@@ -25,11 +27,12 @@ func TcpRaceDial(ctx context.Context, src net.Address, ips []net.IP, port net.Po
 	ips = sortIPs(ips, prioritizeIPv6, interleave)
 	newCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	var resultCh = make(chan *result, len(ips))
+	resultCh := make(chan *result, len(ips))
 	nextTryIndex := 0
 	activeNum := uint32(0)
 	timer := time.NewTimer(0)
 	var winConn net.Conn
+	errors.LogDebug(ctx, "happy eyeballs racing dial for ", domain, " with IPs ", ips)
 	for {
 		select {
 		case r := <-resultCh:
@@ -54,6 +57,7 @@ func TcpRaceDial(ctx context.Context, src net.Address, ips []net.IP, port net.Po
 					timer.Stop()
 					if winConn == nil {
 						winConn = r.conn
+						errors.LogDebug(ctx, "happy eyeballs established connection for ", domain, " with IP ", ips[r.index])
 					} else {
 						r.conn.Close()
 					}
@@ -69,6 +73,7 @@ func TcpRaceDial(ctx context.Context, src net.Address, ips []net.IP, port net.Po
 					continue
 				}
 				if activeNum == 0 {
+					errors.LogDebugInner(ctx, r.err, "happy eyeballs no connection established for ", domain)
 					return nil, r.err
 				}
 				timer.Stop()
@@ -97,8 +102,8 @@ func sortIPs(ips []net.IP, prioritizeIPv6 bool, interleave uint32) []net.IP {
 	if len(ips) == 0 {
 		return ips
 	}
-	var ip4 = make([]net.IP, 0, len(ips))
-	var ip6 = make([]net.IP, 0, len(ips))
+	ip4 := make([]net.IP, 0, len(ips))
+	ip6 := make([]net.IP, 0, len(ips))
 	for _, ip := range ips {
 		parsedIp := net.IPAddress(ip).IP()
 		if len(parsedIp) == net.IPv4len {
@@ -112,7 +117,7 @@ func sortIPs(ips []net.IP, prioritizeIPv6 bool, interleave uint32) []net.IP {
 		return ips
 	}
 
-	var newIPs = make([]net.IP, 0, len(ips))
+	newIPs := make([]net.IP, 0, len(ips))
 	consumeIP4 := 0
 	consumeIP6 := 0
 	consumeTurn := uint32(0)

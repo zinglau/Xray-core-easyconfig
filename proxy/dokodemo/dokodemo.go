@@ -2,10 +2,9 @@ package dokodemo
 
 import (
 	"context"
-	"runtime"
+	"slices"
 	"strconv"
 	"strings"
-	"sync/atomic"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
@@ -14,11 +13,10 @@ import (
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/session"
-	"github.com/xtls/xray-core/common/signal"
-	"github.com/xtls/xray-core/common/task"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/policy"
 	"github.com/xtls/xray-core/features/routing"
+	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet/stat"
 	"github.com/xtls/xray-core/transport/internet/tls"
 )
@@ -34,22 +32,22 @@ func init() {
 }
 
 type DokodemoDoor struct {
-	policyManager policy.Manager
-	config        *Config
-	address       net.Address
-	port          net.Port
-	portMap       map[string]string
-	sockopt       *session.Sockopt
+	policyManager  policy.Manager
+	config         *Config
+	rewriteAddress net.Address
+	rewritePort    net.Port
+	portMap        map[string]string
+	sockopt        *session.Sockopt
 }
 
 // Init initializes the DokodemoDoor instance with necessary parameters.
 func (d *DokodemoDoor) Init(config *Config, pm policy.Manager, sockopt *session.Sockopt) error {
-	if len(config.Networks) == 0 {
+	if len(config.AllowedNetworks) == 0 {
 		return errors.New("no network specified")
 	}
 	d.config = config
-	d.address = config.GetPredefinedAddress()
-	d.port = net.Port(config.Port)
+	d.rewriteAddress = config.GetPredefinedAddress()
+	d.rewritePort = net.Port(config.RewritePort)
 	d.portMap = config.PortMap
 	d.policyManager = pm
 	d.sockopt = sockopt
@@ -59,7 +57,10 @@ func (d *DokodemoDoor) Init(config *Config, pm policy.Manager, sockopt *session.
 
 // Network implements proxy.Inbound.
 func (d *DokodemoDoor) Network() []net.Network {
-	return d.config.Networks
+	if slices.Contains(d.config.AllowedNetworks, net.Network_TCP) {
+		return append(d.config.AllowedNetworks, net.Network_UNIX)
+	}
+	return d.config.AllowedNetworks
 }
 
 func (d *DokodemoDoor) policy() policy.Session {
@@ -71,10 +72,14 @@ func (d *DokodemoDoor) policy() policy.Session {
 // Process implements proxy.Inbound.
 func (d *DokodemoDoor) Process(ctx context.Context, network net.Network, conn stat.Connection, dispatcher routing.Dispatcher) error {
 	errors.LogDebug(ctx, "processing connection from: ", conn.RemoteAddr())
+	// forward to TCP if from UNIX
+	if network == net.Network_UNIX {
+		network = net.Network_TCP
+	}
 	dest := net.Destination{
 		Network: network,
-		Address: d.address,
-		Port:    d.port,
+		Address: d.rewriteAddress,
+		Port:    d.rewritePort,
 	}
 
 	if !d.config.FollowRedirect {
@@ -90,7 +95,7 @@ func (d *DokodemoDoor) Process(ctx context.Context, network net.Network, conn st
 				}
 			}
 		}
-		if dest.Port == 0 {
+		if dest.Port == 0 && port != "" {
 			dest.Port = net.Port(common.Must2(strconv.Atoi(port)))
 		}
 		if d.portMap != nil && d.portMap[port] != "" {
@@ -114,7 +119,8 @@ func (d *DokodemoDoor) Process(ctx context.Context, network net.Network, conn st
 				destinationOverridden = true
 			}
 		}
-		if tlsConn, ok := conn.(tls.Interface); ok && !destinationOverridden {
+		iConn := stat.TryUnwrapStatsConn(conn)
+		if tlsConn, ok := iConn.(tls.Interface); ok && !destinationOverridden {
 			if serverName := tlsConn.HandshakeContextServerName(ctx); serverName != "" {
 				dest.Address = net.DomainAddress(serverName)
 				destinationOverridden = true
@@ -144,39 +150,11 @@ func (d *DokodemoDoor) Process(ctx context.Context, network net.Network, conn st
 	})
 	errors.LogInfo(ctx, "received request for ", conn.RemoteAddr())
 
-	plcy := d.policy()
-	ctx, cancel := context.WithCancel(ctx)
-	timer := signal.CancelAfterInactivity(ctx, cancel, plcy.Timeouts.ConnectionIdle)
-
-	if inbound != nil {
-		inbound.Timer = timer
-	}
-
-	ctx = policy.ContextWithBufferPolicy(ctx, plcy.Buffer)
-	link, err := dispatcher.Dispatch(ctx, dest)
-	if err != nil {
-		return errors.New("failed to dispatch request").Base(err)
-	}
-
-	requestCount := int32(1)
-	requestDone := func() error {
-		defer func() {
-			if atomic.AddInt32(&requestCount, -1) == 0 {
-				timer.SetTimeout(plcy.Timeouts.DownlinkOnly)
-			}
-		}()
-
-		var reader buf.Reader
-		if dest.Network == net.Network_UDP {
-			reader = buf.NewPacketReader(conn)
-		} else {
-			reader = buf.NewReader(conn)
-		}
-		if err := buf.Copy(reader, link.Writer, buf.UpdateActivity(timer)); err != nil {
-			return errors.New("failed to transport request").Base(err)
-		}
-
-		return nil
+	var reader buf.Reader
+	if dest.Network == net.Network_TCP {
+		reader = buf.NewReader(conn)
+	} else {
+		reader = buf.NewPacketReader(conn)
 	}
 
 	var writer buf.Writer
@@ -208,72 +186,19 @@ func (d *DokodemoDoor) Process(ctx context.Context, network net.Network, conn st
 				return err
 			}
 			writer = NewPacketWriter(pConn, &dest, mark, back)
-			defer func() {
-				runtime.Gosched()
-				common.Interrupt(link.Reader) // maybe duplicated
-				runtime.Gosched()
-				writer.(*PacketWriter).Close() // close fake UDP conns
-			}()
-			/*
-				sockopt := &internet.SocketConfig{
-					Tproxy: internet.SocketConfig_TProxy,
-				}
-				if dest.Address.Family().IsIP() {
-					sockopt.BindAddress = dest.Address.IP()
-					sockopt.BindPort = uint32(dest.Port)
-				}
-				if d.sockopt != nil {
-					sockopt.Mark = d.sockopt.Mark
-				}
-				tConn, err := internet.DialSystem(ctx, net.DestinationFromAddr(conn.RemoteAddr()), sockopt)
-				if err != nil {
-					return err
-				}
-				defer tConn.Close()
-
-				writer = &buf.SequentialWriter{Writer: tConn}
-				tReader := buf.NewPacketReader(tConn)
-				requestCount++
-				tproxyRequest = func() error {
-					defer func() {
-						if atomic.AddInt32(&requestCount, -1) == 0 {
-							timer.SetTimeout(plcy.Timeouts.DownlinkOnly)
-						}
-					}()
-					if err := buf.Copy(tReader, link.Writer, buf.UpdateActivity(timer)); err != nil {
-						return errors.New("failed to transport request (TPROXY conn)").Base(err)
-					}
-					return nil
-				}
-			*/
+			defer writer.(*PacketWriter).Close() // close fake UDP conns
 		}
 	}
 
-	responseDone := func() error {
-		defer timer.SetTimeout(plcy.Timeouts.UplinkOnly)
-
-		if network == net.Network_UDP && destinationOverridden {
-			buf.Copy(link.Reader, writer) // respect upload's timeout
-			return nil
-		}
-
-		if err := buf.Copy(link.Reader, writer, buf.UpdateActivity(timer)); err != nil {
-			return errors.New("failed to transport response").Base(err)
-		}
-		return nil
+	if err := dispatcher.DispatchLink(
+		ctx, dest, &transport.Link{
+			Reader: reader,
+			Writer: writer,
+		},
+	); err != nil {
+		return errors.New("failed to dispatch request").Base(err)
 	}
-
-	if err := task.Run(ctx,
-		task.OnSuccess(func() error { return task.Run(ctx, requestDone) }, task.Close(link.Writer)),
-		responseDone); err != nil {
-		runtime.Gosched()
-		common.Interrupt(link.Writer)
-		runtime.Gosched()
-		common.Interrupt(link.Reader)
-		return errors.New("connection ends").Base(err)
-	}
-
-	return nil
+	return nil // Unlike Dispatch(), DispatchLink() will not return until the outbound finishes Process()
 }
 
 func NewPacketWriter(conn net.PacketConn, d *net.Destination, mark int, back *net.UDPAddr) buf.Writer {

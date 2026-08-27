@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/rand"
 	"io"
+	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/pires/go-proxyproto"
@@ -12,6 +14,7 @@ import (
 	"github.com/xtls/xray-core/common/crypto"
 	"github.com/xtls/xray-core/common/dice"
 	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/geodata"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/platform"
 	"github.com/xtls/xray-core/common/retry"
@@ -20,49 +23,198 @@ import (
 	"github.com/xtls/xray-core/common/task"
 	"github.com/xtls/xray-core/common/utils"
 	"github.com/xtls/xray-core/core"
-	"github.com/xtls/xray-core/features/dns"
 	"github.com/xtls/xray-core/features/policy"
 	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/stat"
-	"github.com/xtls/xray-core/transport/internet/tls"
 )
 
-var useSplice bool
+var (
+	useSplice               atomic.Bool
+	allNetworks             [8]bool
+	defaultBlockPrivateRule *FinalRule
+	defaultBlockAllRule     *FinalRule
+)
+
+func reloadEnvSettings() error {
+	const defaultFlagValue = "NOT_DEFINED_AT_ALL"
+	value := platform.NewEnvFlag(platform.UseFreedomSplice).GetValue(func() string { return defaultFlagValue })
+	enabled := false
+	switch value {
+	case defaultFlagValue, "auto", "enable":
+		enabled = true
+	}
+	useSplice.Store(enabled)
+	return nil
+}
 
 func init() {
 	common.Must(common.RegisterConfig((*Config)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
 		h := new(Handler)
-		if err := core.RequireFeatures(ctx, func(pm policy.Manager, d dns.Client) error {
-			return h.Init(config.(*Config), pm, d)
+		if err := core.RequireFeatures(ctx, func(pm policy.Manager) error {
+			return h.Init(config.(*Config), pm)
 		}); err != nil {
 			return nil, err
 		}
 		return h, nil
 	}))
-	const defaultFlagValue = "NOT_DEFINED_AT_ALL"
-	value := platform.NewEnvFlag(platform.UseFreedomSplice).GetValue(func() string { return defaultFlagValue })
-	switch value {
-	case defaultFlagValue, "auto", "enable":
-		useSplice = true
+
+	platform.RegisterEnvReload(reloadEnvSettings)
+
+	for i := range allNetworks {
+		allNetworks[i] = true
 	}
+
+	defaultBlockPrivateRule = &FinalRule{
+		action:  RuleAction_Block,
+		network: allNetworks,
+		ip:      geodata.GetPrivateIPMatcher(),
+	}
+
+	defaultBlockAllRule = &FinalRule{
+		action:  RuleAction_Block,
+		network: allNetworks,
+	}
+}
+
+type FinalRule struct {
+	action     RuleAction
+	network    [8]bool
+	port       net.MemoryPortList
+	ip         geodata.IPMatcher
+	blockDelay *Range
 }
 
 // Handler handles Freedom connections.
 type Handler struct {
 	policyManager policy.Manager
-	dns           dns.Client
 	config        *Config
+	finalRules    []*FinalRule
+}
+
+func buildFinalRule(config *FinalRuleConfig) (*FinalRule, error) {
+	rule := &FinalRule{
+		action:     config.GetAction(),
+		blockDelay: config.GetBlockDelay(),
+	}
+
+	if len(config.Networks) == 0 {
+		rule.network = allNetworks
+	} else {
+		for _, network := range config.Networks {
+			rule.network[int(network)] = true
+		}
+	}
+
+	if config.PortList != nil {
+		rule.port = net.PortListFromProto(config.PortList)
+	}
+
+	if len(config.Ip) > 0 {
+		matcher, err := geodata.IPReg.BuildIPMatcher(config.Ip)
+		if err != nil {
+			return nil, err
+		}
+		rule.ip = matcher
+	}
+
+	return rule, nil
+}
+
+func (r *FinalRule) matchNetwork(network net.Network) bool {
+	return r.network[int(network)]
+}
+
+func (r *FinalRule) matchPort(port net.Port) bool {
+	if len(r.port) == 0 {
+		return true
+	}
+	return r.port.Contains(port)
+}
+
+func (r *FinalRule) matchIP(addr net.Address) bool {
+	if r.ip == nil {
+		return true
+	}
+	return addr != nil && addr.Family().IsIP() && r.ip.Match(addr.IP())
+}
+
+func (r *FinalRule) Apply(network net.Network, address net.Address, port net.Port) bool {
+	if !r.matchNetwork(network) {
+		return false
+	}
+	if !r.matchPort(port) {
+		return false
+	}
+	return r.matchIP(address)
+}
+
+func getDefaultFinalRule(inbound *session.Inbound) *FinalRule {
+	if inbound == nil {
+		return nil
+	}
+	switch inbound.Name {
+	case "vless-reverse":
+		return defaultBlockAllRule
+	case "vless", "vmess", "trojan", "hysteria", "wireguard":
+		return defaultBlockPrivateRule
+	default:
+		if strings.HasPrefix(inbound.Name, "shadowsocks") {
+			return defaultBlockPrivateRule
+		}
+	}
+	return nil
+}
+
+func (h *Handler) shouldResolveDomainBeforeFinalRules(dialDest net.Destination, defaultRule *FinalRule) bool {
+	if !dialDest.Address.Family().IsDomain() {
+		return false
+	}
+	if len(h.finalRules) > 0 {
+		rule := h.finalRules[0]
+		if rule.action == RuleAction_Allow && rule.network[dialDest.Network] && len(rule.port) == 0 && rule.ip == nil {
+			return false
+		}
+	}
+	if defaultRule != nil || len(h.finalRules) > 0 {
+		return true
+	}
+	return false
+}
+
+func (h *Handler) matchFinalRule(network net.Network, address net.Address, port net.Port, defaultRule *FinalRule) *FinalRule {
+	for _, rule := range h.finalRules {
+		if rule.Apply(network, address, port) {
+			return rule
+		}
+	}
+	if defaultRule != nil && defaultRule.Apply(network, address, port) {
+		return defaultRule
+	}
+	return nil
+}
+
+func (h *Handler) applyFinalRules(network net.Network, address net.Address, port net.Port, defaultRule *FinalRule) RuleAction {
+	if rule := h.matchFinalRule(network, address, port, defaultRule); rule != nil {
+		return rule.action
+	}
+	return RuleAction_Allow
 }
 
 // Init initializes the Handler with necessary parameters.
-func (h *Handler) Init(config *Config, pm policy.Manager, d dns.Client) error {
+func (h *Handler) Init(config *Config, pm policy.Manager) error {
 	h.config = config
 	h.policyManager = pm
-	h.dns = d
-
+	h.finalRules = make([]*FinalRule, 0, len(config.FinalRules))
+	for _, rc := range config.FinalRules {
+		rule, err := buildFinalRule(rc)
+		if err != nil {
+			return errors.New("failed to build final rule").Base(err)
+		}
+		h.finalRules = append(h.finalRules, rule)
+	}
 	return nil
 }
 
@@ -71,26 +223,18 @@ func (h *Handler) policy() policy.Session {
 	return p
 }
 
-func (h *Handler) resolveIP(ctx context.Context, domain string, localAddr net.Address) net.Address {
-	ips, _, err := h.dns.LookupIP(domain, dns.IPOption{
-		IPv4Enable: (localAddr == nil || localAddr.Family().IsIPv4()) && h.config.preferIP4(),
-		IPv6Enable: (localAddr == nil || localAddr.Family().IsIPv6()) && h.config.preferIP6(),
-	})
-	{ // Resolve fallback
-		if (len(ips) == 0 || err != nil) && h.config.hasFallback() && localAddr == nil {
-			ips, _, err = h.dns.LookupIP(domain, dns.IPOption{
-				IPv4Enable: h.config.fallbackIP4(),
-				IPv6Enable: h.config.fallbackIP6(),
-			})
-		}
+func (h *Handler) blockDelay(rule *FinalRule) time.Duration {
+	min := uint64(30)
+	max := uint64(90)
+	if rule.blockDelay != nil {
+		min = rule.blockDelay.Min
+		max = rule.blockDelay.Max
 	}
-	if err != nil {
-		errors.LogInfoInner(ctx, err, "failed to get IP address for domain ", domain)
+	span := max - min
+	if max < min {
+		span = min - max
 	}
-	if len(ips) == 0 {
-		return nil
-	}
-	return net.IPAddress(ips[dice.Roll(len(ips))])
+	return time.Duration(min+uint64(dice.Roll(int(span+1)))) * time.Second
 }
 
 func isValidAddress(addr *net.IPOrDomain) bool {
@@ -99,7 +243,7 @@ func isValidAddress(addr *net.IPOrDomain) bool {
 	}
 
 	a := addr.AsAddress()
-	return a != net.AnyIP
+	return a != net.AnyIP && a != net.AnyIPv6
 }
 
 // Process implements proxy.Outbound.
@@ -112,8 +256,15 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	ob.Name = "freedom"
 	ob.CanSpliceCopy = 1
 	inbound := session.InboundFromContext(ctx)
+	defaultRule := getDefaultFinalRule(inbound)
 
 	destination := ob.Target
+	origTargetAddr := ob.OriginalTarget.Address
+	if origTargetAddr == nil {
+		origTargetAddr = ob.Target.Address
+	}
+	dialer.SetOutboundGateway(ctx, ob)
+	outGateway := ob.Gateway
 	UDPOverride := net.UDPDestination(nil, 0)
 	if h.config.DestinationOverride != nil {
 		server := h.config.DestinationOverride.Server
@@ -131,20 +282,60 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	output := link.Writer
 
 	var conn stat.Connection
+	var blockedDest *net.Destination
+	var blockedRule *FinalRule
+	firstResolve := true
 	err := retry.ExponentialBackoff(5, 100).On(func() error {
 		dialDest := destination
-		if h.config.hasStrategy() && dialDest.Address.Family().IsDomain() {
-			ip := h.resolveIP(ctx, dialDest.Address.Domain(), dialer.Address())
-			if ip != nil {
+		if h.config.DomainStrategy.HasStrategy() && dialDest.Address.Family().IsDomain() {
+			strategy := h.config.DomainStrategy
+			if destination.Network == net.Network_UDP && origTargetAddr != nil && outGateway == nil {
+				strategy = strategy.GetDynamicStrategy(origTargetAddr.Family())
+			}
+			ips, err := internet.LookupForIP(dialDest.Address.Domain(), strategy, outGateway)
+			if err != nil {
+				errors.LogInfoInner(ctx, err, "failed to get IP address for domain ", dialDest.Address.Domain())
+				if h.config.DomainStrategy.ForceIP() || h.shouldResolveDomainBeforeFinalRules(dialDest, defaultRule) {
+					return err
+				}
+			} else {
 				dialDest = net.Destination{
 					Network: dialDest.Network,
-					Address: ip,
+					Address: net.IPAddress(ips[dice.Roll(len(ips))]),
 					Port:    dialDest.Port,
 				}
 				errors.LogInfo(ctx, "dialing to ", dialDest)
-			} else if h.config.forceIP() {
-				return dns.ErrEmptyResponse
 			}
+		} else if h.shouldResolveDomainBeforeFinalRules(dialDest, defaultRule) { // asis + domain + hasrules
+			domain := dialDest.Address.Domain()
+			var ips []net.IP
+			if firstResolve {
+				firstResolve = false
+				supportIPv4, supportIPv6 := utils.CheckRoutes()
+				if supportIPv4 {
+					ips, _ = net.DefaultResolver.LookupIP(ctx, "ip4", domain)
+				}
+				if len(ips) == 0 && supportIPv6 {
+					ips, _ = net.DefaultResolver.LookupIP(ctx, "ip6", domain)
+				}
+				if len(ips) == 0 {
+					return errors.New("failed to get IP address for domain ", domain)
+				}
+			} else {
+				ips, _ = net.DefaultResolver.LookupIP(ctx, "ip", domain)
+			}
+			if len(ips) == 0 { // SRV/TXT, lookup failed
+				return errors.New("failed to get IP address for domain ", domain)
+			}
+			if addr := net.IPAddress(ips[dice.Roll(len(ips))]); addr != nil {
+				dialDest.Address = addr
+				errors.LogInfo(ctx, "dialing to ", dialDest)
+			}
+		}
+		if rule := h.matchFinalRule(dialDest.Network, dialDest.Address, dialDest.Port, defaultRule); rule != nil && rule.action == RuleAction_Block {
+			blockedDest = &dialDest
+			blockedRule = rule
+			return nil
 		}
 
 		rawConn, err := dialer.Dial(ctx, dialDest)
@@ -152,22 +343,36 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			return err
 		}
 
-		if h.config.ProxyProtocol > 0 && h.config.ProxyProtocol <= 2 {
-			version := byte(h.config.ProxyProtocol)
-			srcAddr := inbound.Source.RawNetAddr()
-			dstAddr := rawConn.RemoteAddr()
-			header := proxyproto.HeaderProxyFromAddrs(version, srcAddr, dstAddr)
-			if _, err = header.WriteTo(rawConn); err != nil {
-				rawConn.Close()
-				return err
-			}
-		}
-
 		conn = rawConn
 		return nil
 	})
 	if err != nil {
 		return errors.New("failed to open connection to ", destination).Base(err)
+	}
+	if blockedDest != nil {
+		delay := h.blockDelay(blockedRule)
+		errors.LogInfo(ctx, "blocked target: ", *blockedDest, ", blackholing connection for ", delay)
+		timer := time.AfterFunc(delay, func() {
+			common.Interrupt(input)
+			common.Interrupt(output)
+			errors.LogInfo(ctx, "closed blackholed connection to blocked target: ", *blockedDest)
+		})
+		defer timer.Stop()
+		defer common.Close(output)
+		if err := buf.Copy(input, buf.Discard); err != nil {
+			return nil
+		}
+		return nil
+	}
+	if h.config.ProxyProtocol > 0 && h.config.ProxyProtocol <= 2 {
+		version := byte(h.config.ProxyProtocol)
+		srcAddr := inbound.Source.RawNetAddr()
+		dstAddr := conn.RemoteAddr()
+		header := proxyproto.HeaderProxyFromAddrs(version, srcAddr, dstAddr)
+		if _, err = header.WriteTo(conn); err != nil {
+			conn.Close()
+			return errors.New("failed to set PROXY protocol v", version).Base(err)
+		}
 	}
 	defer conn.Close()
 	errors.LogInfo(ctx, "connection opened to ", destination, ", local endpoint ", conn.LocalAddr(), ", remote endpoint ", conn.RemoteAddr())
@@ -203,7 +408,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 				writer = buf.NewWriter(conn)
 			}
 		} else {
-			writer = NewPacketWriter(conn, h, ctx, UDPOverride, destination)
+			writer = NewPacketWriter(conn, h, defaultRule, UDPOverride, destination)
 			if h.config.Noises != nil {
 				errors.LogDebug(ctx, "NOISE", h.config.Noises)
 				writer = &NoisePacketWriter{
@@ -225,22 +430,20 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
 	responseDone := func() error {
 		defer timer.SetTimeout(plcy.Timeouts.UplinkOnly)
-		if destination.Network == net.Network_TCP {
+		if destination.Network == net.Network_TCP && useSplice.Load() && proxy.IsRAWTransportWithoutSecurity(conn) { // it would be tls conn in special use case of MITM, we need to let link handle traffic
 			var writeConn net.Conn
 			var inTimer *signal.ActivityTimer
-			if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil && useSplice {
+			if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
 				writeConn = inbound.Conn
 				inTimer = inbound.Timer
 			}
-			if !isTLSConn(conn) { // it would be tls conn in special use case of MITM, we need to let link handle traffic
-				return proxy.CopyRawConnIfExist(ctx, conn, writeConn, link.Writer, timer, inTimer)
-			}
+			return proxy.CopyRawConnIfExist(ctx, conn, writeConn, link.Writer, timer, inTimer)
 		}
 		var reader buf.Reader
 		if destination.Network == net.Network_TCP {
 			reader = buf.NewReader(conn)
 		} else {
-			reader = NewPacketReader(conn, UDPOverride, destination)
+			reader = NewPacketReader(conn, h, defaultRule, UDPOverride, destination)
 		}
 		if err := buf.Copy(reader, output, buf.UpdateActivity(timer)); err != nil {
 			return errors.New("failed to process response").Base(err)
@@ -259,23 +462,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	return nil
 }
 
-func isTLSConn(conn stat.Connection) bool {
-	if conn != nil {
-		statConn, ok := conn.(*stat.CounterConnection)
-		if ok {
-			conn = statConn.Connection
-		}
-		if _, ok := conn.(*tls.Conn); ok {
-			return true
-		}
-		if _, ok := conn.(*tls.UConn); ok {
-			return true
-		}
-	}
-	return false
-}
-
-func NewPacketReader(conn net.Conn, UDPOverride net.Destination, DialDest net.Destination) buf.Reader {
+func NewPacketReader(conn net.Conn, h *Handler, defaultRule *FinalRule, UDPOverride net.Destination, DialDest net.Destination) buf.Reader {
 	iConn := conn
 	statConn, ok := iConn.(*stat.CounterConnection)
 	if ok {
@@ -294,6 +481,8 @@ func NewPacketReader(conn net.Conn, UDPOverride net.Destination, DialDest net.De
 		return &PacketReader{
 			PacketConnWrapper: c,
 			Counter:           counter,
+			Handler:           h,
+			DefaultRule:       defaultRule,
 			IsOverridden:      isOverridden,
 			InitUnchangedAddr: DialDest.Address,
 			InitChangedAddr:   net.DestinationFromAddr(conn.RemoteAddr()).Address,
@@ -305,6 +494,8 @@ func NewPacketReader(conn net.Conn, UDPOverride net.Destination, DialDest net.De
 type PacketReader struct {
 	*internet.PacketConnWrapper
 	stats.Counter
+	Handler           *Handler
+	DefaultRule       *FinalRule
 	IsOverridden      bool
 	InitUnchangedAddr net.Address
 	InitChangedAddr   net.Address
@@ -313,33 +504,40 @@ type PacketReader struct {
 func (r *PacketReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 	b := buf.New()
 	b.Resize(0, buf.Size)
-	n, d, err := r.PacketConnWrapper.ReadFrom(b.Bytes())
-	if err != nil {
-		b.Release()
-		return nil, err
-	}
-	b.Resize(0, int32(n))
-	// if udp dest addr is changed, we are unable to get the correct src addr
-	// so we don't attach src info to udp packet, break cone behavior, assuming the dial dest is the expected scr addr
-	if !r.IsOverridden {
-		address := net.IPAddress(d.(*net.UDPAddr).IP)
-		if r.InitChangedAddr == address {
-			address = r.InitUnchangedAddr
+	for {
+		n, d, err := r.PacketConnWrapper.ReadFrom(b.Bytes())
+		if err != nil {
+			b.Release()
+			return nil, err
 		}
-		b.UDP = &net.Destination{
-			Address: address,
-			Port:    net.Port(d.(*net.UDPAddr).Port),
-			Network: net.Network_UDP,
+		udpAddr := d.(*net.UDPAddr)
+		sourceAddr := net.IPAddress(udpAddr.IP)
+		if r.Handler.applyFinalRules(net.Network_UDP, sourceAddr, net.Port(udpAddr.Port), r.DefaultRule) == RuleAction_Block {
+			continue
 		}
+		b.Resize(0, int32(n))
+
+		// if udp dest addr is changed, we are unable to get the correct src addr
+		// so we don't attach src info to udp packet, break cone behavior, assuming the dial dest is the expected scr addr
+		if !r.IsOverridden {
+			if r.InitChangedAddr == sourceAddr {
+				sourceAddr = r.InitUnchangedAddr
+			}
+			b.UDP = &net.Destination{
+				Address: sourceAddr,
+				Port:    net.Port(udpAddr.Port),
+				Network: net.Network_UDP,
+			}
+		}
+		if r.Counter != nil {
+			r.Counter.Add(int64(n))
+		}
+		return buf.MultiBuffer{b}, nil
 	}
-	if r.Counter != nil {
-		r.Counter.Add(int64(n))
-	}
-	return buf.MultiBuffer{b}, nil
 }
 
 // DialDest means the dial target used in the dialer when creating conn
-func NewPacketWriter(conn net.Conn, h *Handler, ctx context.Context, UDPOverride net.Destination, DialDest net.Destination) buf.Writer {
+func NewPacketWriter(conn net.Conn, h *Handler, defaultRule *FinalRule, UDPOverride net.Destination, DialDest net.Destination) buf.Writer {
 	iConn := conn
 	statConn, ok := iConn.(*stat.CounterConnection)
 	if ok {
@@ -360,9 +558,10 @@ func NewPacketWriter(conn net.Conn, h *Handler, ctx context.Context, UDPOverride
 			PacketConnWrapper: c,
 			Counter:           counter,
 			Handler:           h,
-			Context:           ctx,
+			DefaultRule:       defaultRule,
 			UDPOverride:       UDPOverride,
-			resolvedUDPAddr:   resolvedUDPAddr,
+			ResolvedUDPAddr:   resolvedUDPAddr,
+			LocalAddr:         net.DestinationFromAddr(conn.LocalAddr()).Address,
 		}
 
 	}
@@ -373,14 +572,15 @@ type PacketWriter struct {
 	*internet.PacketConnWrapper
 	stats.Counter
 	*Handler
-	context.Context
+	DefaultRule *FinalRule
 	UDPOverride net.Destination
 
 	// Dest of udp packets might be a domain, we will resolve them to IP
 	// But resolver will return a random one if the domain has many IPs
 	// Resulting in these packets being sent to many different IPs randomly
 	// So, cache and keep the resolve result
-	resolvedUDPAddr *utils.TypedSyncMap[string, net.Address]
+	ResolvedUDPAddr *utils.TypedSyncMap[string, net.Address]
+	LocalAddr       net.Address
 }
 
 func (w *PacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
@@ -400,19 +600,21 @@ func (w *PacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 				b.UDP.Port = w.UDPOverride.Port
 			}
 			if b.UDP.Address.Family().IsDomain() {
-				if ip, ok := w.resolvedUDPAddr.Load(b.UDP.Address.Domain()); ok {
+				if ip, ok := w.ResolvedUDPAddr.Load(b.UDP.Address.Domain()); ok {
 					b.UDP.Address = ip
 				} else {
 					ShouldUseSystemResolver := true
-					if w.Handler.config.hasStrategy() {
-						ip = w.Handler.resolveIP(w.Context, b.UDP.Address.Domain(), nil)
-						if ip != nil {
+					if w.Handler.config.DomainStrategy.HasStrategy() {
+						ips, err := internet.LookupForIP(b.UDP.Address.Domain(), w.Handler.config.DomainStrategy, w.LocalAddr)
+						if err != nil {
+							// drop packet if resolve failed when forceIP
+							if w.Handler.config.DomainStrategy.ForceIP() {
+								b.Release()
+								continue
+							}
+						} else {
+							ip = net.IPAddress(ips[dice.Roll(len(ips))])
 							ShouldUseSystemResolver = false
-						}
-						// drop packet if resolve failed when forceIP
-						if ip == nil && w.Handler.config.forceIP() {
-							b.Release()
-							continue
 						}
 					}
 					if ShouldUseSystemResolver {
@@ -425,11 +627,15 @@ func (w *PacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 						}
 					}
 					if ip != nil {
-						b.UDP.Address, _ = w.resolvedUDPAddr.LoadOrStore(b.UDP.Address.Domain(), ip)
+						b.UDP.Address, _ = w.ResolvedUDPAddr.LoadOrStore(b.UDP.Address.Domain(), ip)
 					}
 				}
 			}
-			destAddr, _ := net.ResolveUDPAddr("udp", b.UDP.NetAddr())
+			if w.applyFinalRules(net.Network_UDP, b.UDP.Address, b.UDP.Port, w.DefaultRule) == RuleAction_Block {
+				b.Release()
+				continue
+			}
+			destAddr := b.UDP.RawNetAddr()
 			if destAddr == nil {
 				b.Release()
 				continue
@@ -462,7 +668,7 @@ type NoisePacketWriter struct {
 func (w *NoisePacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	if w.firstWrite {
 		w.firstWrite = false
-		//Do not send Noise for dns requests(just to be safe)
+		// Do not send Noise for dns requests(just to be safe)
 		if w.UDPOverride.Port == 53 {
 			return w.Writer.WriteMultiBuffer(mb)
 		}
@@ -485,18 +691,21 @@ func (w *NoisePacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 			default:
 				panic("unreachable, applyTo is ip/ipv4/ipv6")
 			}
-			//User input string or base64 encoded string or hex string
+			// User input string or base64 encoded string or hex string
 			if n.Packet != nil {
 				noise = n.Packet
 			} else {
-				//Random noise
+				// Random noise
 				noise, err = GenerateRandomBytes(crypto.RandBetween(int64(n.LengthMin),
 					int64(n.LengthMax)))
 			}
 			if err != nil {
 				return err
 			}
-			w.Writer.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes(noise)})
+			err = w.Writer.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes(noise)})
+			if err != nil {
+				return err
+			}
 
 			if n.DelayMin != 0 || n.DelayMax != 0 {
 				time.Sleep(time.Duration(crypto.RandBetween(int64(n.DelayMin), int64(n.DelayMax))) * time.Millisecond)

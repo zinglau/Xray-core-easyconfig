@@ -21,9 +21,10 @@ import (
 )
 
 type requestHandler struct {
-	host string
-	path string
-	ln   *Listener
+	host           string
+	path           string
+	ln             *Listener
+	socketSettings *internet.SocketConfig
 }
 
 var replacer = strings.NewReplacer("+", "-", "/", "_", "=", "")
@@ -64,14 +65,12 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 		return
 	}
 
-	forwardedAddrs := http_proto.ParseXForwardedFor(request.Header)
 	remoteAddr := conn.RemoteAddr()
-	if len(forwardedAddrs) > 0 && forwardedAddrs[0].Family().IsIP() {
-		remoteAddr = &net.TCPAddr{
-			IP:   forwardedAddrs[0].IP(),
-			Port: int(0),
-		}
+	var trustedXFF []string
+	if h.socketSettings != nil {
+		trustedXFF = h.socketSettings.TrustedXForwardedFor
 	}
+	remoteAddr = http_proto.ApplyTrustedXForwardedFor(request.Header, trustedXFF, remoteAddr)
 
 	h.ln.addConn(NewConnection(conn, remoteAddr, extraReader, h.ln.config.HeartbeatPeriod))
 }
@@ -118,6 +117,10 @@ func ListenWS(ctx context.Context, address net.Address, port net.Port, streamSet
 		errors.LogInfo(ctx, "listening TCP(for WS) on ", address, ":", port)
 	}
 
+	if streamSettings.TcpmaskManager != nil {
+		listener, _ = streamSettings.TcpmaskManager.WrapListener(listener)
+	}
+
 	if streamSettings.SocketSettings != nil && streamSettings.SocketSettings.AcceptProxyProtocol {
 		errors.LogWarning(ctx, "accepting PROXY protocol")
 	}
@@ -132,9 +135,10 @@ func ListenWS(ctx context.Context, address net.Address, port net.Port, streamSet
 
 	l.server = http.Server{
 		Handler: &requestHandler{
-			host: wsSettings.Host,
-			path: wsSettings.GetNormalizedPath(),
-			ln:   l,
+			host:           wsSettings.Host,
+			path:           wsSettings.GetNormalizedPath(),
+			ln:             l,
+			socketSettings: streamSettings.SocketSettings,
 		},
 		ReadHeaderTimeout: time.Second * 4,
 		MaxHeaderBytes:    8192,

@@ -5,6 +5,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"hash/crc64"
+	"sync/atomic"
 	"time"
 
 	"github.com/xtls/xray-core/common"
@@ -29,27 +30,24 @@ import (
 
 // Handler is an outbound connection handler for VMess protocol.
 type Handler struct {
-	serverList    *protocol.ServerList
-	serverPicker  protocol.ServerPicker
+	server        *protocol.ServerSpec
 	policyManager policy.Manager
 	cone          bool
 }
 
 // New creates a new VMess outbound handler.
 func New(ctx context.Context, config *Config) (*Handler, error) {
-	serverList := protocol.NewServerList()
-	for _, rec := range config.Receiver {
-		s, err := protocol.NewServerSpecFromPB(rec)
-		if err != nil {
-			return nil, errors.New("failed to parse server spec").Base(err)
-		}
-		serverList.AddServer(s)
+	if config.Receiver == nil {
+		return nil, errors.New(`no vnext found`)
+	}
+	server, err := protocol.NewServerSpecFromPB(config.Receiver)
+	if err != nil {
+		return nil, errors.New("failed to get server spec").Base(err)
 	}
 
 	v := core.MustFromContext(ctx)
 	handler := &Handler{
-		serverList:    serverList,
-		serverPicker:  protocol.NewRoundRobinServerPicker(serverList),
+		server:        server,
 		policyManager: v.GetFeature(policy.ManagerType()).(policy.Manager),
 		cone:          ctx.Value("cone").(bool),
 	}
@@ -67,11 +65,11 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	ob.Name = "vmess"
 	ob.CanSpliceCopy = 3
 
-	var rec *protocol.ServerSpec
+	rec := h.server
 	var conn stat.Connection
+
 	err := retry.ExponentialBackoff(5, 200).On(func() error {
-		rec = h.serverPicker.PickServer()
-		rawConn, err := dialer.Dial(ctx, rec.Destination())
+		rawConn, err := dialer.Dial(ctx, rec.Destination)
 		if err != nil {
 			return err
 		}
@@ -85,7 +83,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	defer conn.Close()
 
 	target := ob.Target
-	errors.LogInfo(ctx, "tunneling request to ", target, " via ", rec.Destination().NetAddr())
+	errors.LogInfo(ctx, "tunneling request to ", target, " via ", rec.Destination.NetAddr())
 
 	command := protocol.RequestCommandTCP
 	if target.Network == net.Network_UDP {
@@ -95,7 +93,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		command = protocol.RequestCommandMux
 	}
 
-	user := rec.PickUser()
+	user := rec.User
 	request := &protocol.RequestHeader{
 		Version: encoding.Version,
 		User:    user,
@@ -108,18 +106,12 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	account := request.User.Account.(*vmess.MemoryAccount)
 	request.Security = account.Security
 
-	if request.Security == protocol.SecurityType_AES128_GCM || request.Security == protocol.SecurityType_NONE || request.Security == protocol.SecurityType_CHACHA20_POLY1305 {
+	if request.Security == protocol.SecurityType_AES128_GCM || request.Security == protocol.SecurityType_CHACHA20_POLY1305 {
 		request.Option.Set(protocol.RequestOptionChunkMasking)
 	}
 
 	if shouldEnablePadding(request.Security) && request.Option.Has(protocol.RequestOptionChunkMasking) {
 		request.Option.Set(protocol.RequestOptionGlobalPadding)
-	}
-
-	if request.Security == protocol.SecurityType_ZERO {
-		request.Security = protocol.SecurityType_NONE
-		request.Option.Clear(protocol.RequestOptionChunkStream)
-		request.Option.Clear(protocol.RequestOptionChunkMasking)
 	}
 
 	if account.AuthenticatedLengthExperiment {
@@ -202,7 +194,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		if err != nil {
 			return errors.New("failed to read header").Base(err)
 		}
-		h.handleCommand(rec.Destination(), header.Command)
+		h.handleCommand(rec.Destination, header.Command)
 
 		bodyReader, err := session.DecodeResponseBody(request, reader)
 		if err != nil {
@@ -227,12 +219,17 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	return nil
 }
 
-var (
-	enablePadding = false
-)
+var enablePadding atomic.Bool
 
 func shouldEnablePadding(s protocol.SecurityType) bool {
-	return enablePadding || s == protocol.SecurityType_AES128_GCM || s == protocol.SecurityType_CHACHA20_POLY1305 || s == protocol.SecurityType_AUTO
+	return enablePadding.Load() || s == protocol.SecurityType_AES128_GCM || s == protocol.SecurityType_CHACHA20_POLY1305 || s == protocol.SecurityType_AUTO
+}
+
+func reloadEnvSettings() error {
+	const defaultFlagValue = "NOT_DEFINED_AT_ALL"
+	paddingValue := platform.NewEnvFlag(platform.UseVmessPadding).GetValue(func() string { return defaultFlagValue })
+	enablePadding.Store(paddingValue != defaultFlagValue)
+	return nil
 }
 
 func init() {
@@ -240,10 +237,5 @@ func init() {
 		return New(ctx, config.(*Config))
 	}))
 
-	const defaultFlagValue = "NOT_DEFINED_AT_ALL"
-
-	paddingValue := platform.NewEnvFlag(platform.UseVmessPadding).GetValue(func() string { return defaultFlagValue })
-	if paddingValue != defaultFlagValue {
-		enablePadding = true
-	}
+	platform.RegisterEnvReload(reloadEnvSettings)
 }

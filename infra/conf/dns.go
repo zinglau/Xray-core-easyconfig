@@ -3,6 +3,7 @@ package conf
 import (
 	"bufio"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -10,25 +11,27 @@ import (
 	"strings"
 
 	"github.com/xtls/xray-core/app/dns"
-	"github.com/xtls/xray-core/app/router"
 	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/geodata"
 	"github.com/xtls/xray-core/common/net"
 )
 
 type NameServerConfig struct {
-	Address       *Address   `json:"address"`
-	ClientIP      *Address   `json:"clientIp"`
-	Port          uint16     `json:"port"`
-	SkipFallback  bool       `json:"skipFallback"`
-	Domains       []string   `json:"domains"`
-	ExpectedIPs   StringList `json:"expectedIPs"`
-	ExpectIPs     StringList `json:"expectIPs"`
-	QueryStrategy string     `json:"queryStrategy"`
-	Tag           string     `json:"tag"`
-	TimeoutMs     uint64     `json:"timeoutMs"`
-	DisableCache  bool       `json:"disableCache"`
-	FinalQuery    bool       `json:"finalQuery"`
-	UnexpectedIPs StringList `json:"unexpectedIPs"`
+	Address         *Address   `json:"address"`
+	ClientIP        *Address   `json:"clientIp"`
+	Port            uint16     `json:"port"`
+	SkipFallback    bool       `json:"skipFallback"`
+	Domains         StringList `json:"domains"`
+	ExpectedIPs     StringList `json:"expectedIPs"`
+	ExpectIPs       StringList `json:"expectIPs"`
+	QueryStrategy   string     `json:"queryStrategy"`
+	Tag             string     `json:"tag"`
+	TimeoutMs       uint64     `json:"timeoutMs"`
+	DisableCache    *bool      `json:"disableCache"`
+	ServeStale      *bool      `json:"serveStale"`
+	ServeExpiredTTL *uint32    `json:"serveExpiredTTL"`
+	FinalQuery      bool       `json:"finalQuery"`
+	UnexpectedIPs   StringList `json:"unexpectedIPs"`
 }
 
 // UnmarshalJSON implements encoding/json.Unmarshaler.UnmarshalJSON
@@ -40,19 +43,21 @@ func (c *NameServerConfig) UnmarshalJSON(data []byte) error {
 	}
 
 	var advanced struct {
-		Address       *Address   `json:"address"`
-		ClientIP      *Address   `json:"clientIp"`
-		Port          uint16     `json:"port"`
-		SkipFallback  bool       `json:"skipFallback"`
-		Domains       []string   `json:"domains"`
-		ExpectedIPs   StringList `json:"expectedIPs"`
-		ExpectIPs     StringList `json:"expectIPs"`
-		QueryStrategy string     `json:"queryStrategy"`
-		Tag           string     `json:"tag"`
-		TimeoutMs     uint64     `json:"timeoutMs"`
-		DisableCache  bool       `json:"disableCache"`
-		FinalQuery    bool       `json:"finalQuery"`
-		UnexpectedIPs StringList `json:"unexpectedIPs"`
+		Address         *Address   `json:"address"`
+		ClientIP        *Address   `json:"clientIp"`
+		Port            uint16     `json:"port"`
+		SkipFallback    bool       `json:"skipFallback"`
+		Domains         StringList `json:"domains"`
+		ExpectedIPs     StringList `json:"expectedIPs"`
+		ExpectIPs       StringList `json:"expectIPs"`
+		QueryStrategy   string     `json:"queryStrategy"`
+		Tag             string     `json:"tag"`
+		TimeoutMs       uint64     `json:"timeoutMs"`
+		DisableCache    *bool      `json:"disableCache"`
+		ServeStale      *bool      `json:"serveStale"`
+		ServeExpiredTTL *uint32    `json:"serveExpiredTTL"`
+		FinalQuery      bool       `json:"finalQuery"`
+		UnexpectedIPs   StringList `json:"unexpectedIPs"`
 	}
 	if err := json.Unmarshal(data, &advanced); err == nil {
 		c.Address = advanced.Address
@@ -66,6 +71,8 @@ func (c *NameServerConfig) UnmarshalJSON(data []byte) error {
 		c.Tag = advanced.Tag
 		c.TimeoutMs = advanced.TimeoutMs
 		c.DisableCache = advanced.DisableCache
+		c.ServeStale = advanced.ServeStale
+		c.ServeExpiredTTL = advanced.ServeExpiredTTL
 		c.FinalQuery = advanced.FinalQuery
 		c.UnexpectedIPs = advanced.UnexpectedIPs
 		return nil
@@ -74,45 +81,14 @@ func (c *NameServerConfig) UnmarshalJSON(data []byte) error {
 	return errors.New("failed to parse name server: ", string(data))
 }
 
-func toDomainMatchingType(t router.Domain_Type) dns.DomainMatchingType {
-	switch t {
-	case router.Domain_Domain:
-		return dns.DomainMatchingType_Subdomain
-	case router.Domain_Full:
-		return dns.DomainMatchingType_Full
-	case router.Domain_Plain:
-		return dns.DomainMatchingType_Keyword
-	case router.Domain_Regex:
-		return dns.DomainMatchingType_Regex
-	default:
-		panic("unknown domain type")
-	}
-}
-
 func (c *NameServerConfig) Build() (*dns.NameServer, error) {
 	if c.Address == nil {
-		return nil, errors.New("NameServer address is not specified.")
+		return nil, errors.New("nameserver address is not specified")
 	}
 
-	var domains []*dns.NameServer_PriorityDomain
-	var originalRules []*dns.NameServer_OriginalRule
-
-	for _, rule := range c.Domains {
-		parsedDomain, err := parseDomainRule(rule)
-		if err != nil {
-			return nil, errors.New("invalid domain rule: ", rule).Base(err)
-		}
-
-		for _, pd := range parsedDomain {
-			domains = append(domains, &dns.NameServer_PriorityDomain{
-				Type:   toDomainMatchingType(pd.Type),
-				Domain: pd.Value,
-			})
-		}
-		originalRules = append(originalRules, &dns.NameServer_OriginalRule{
-			Rule: rule,
-			Size: uint32(len(parsedDomain)),
-		})
+	domainRules, err := geodata.ParseDomainRules(c.Domains, geodata.Domain_Substr)
+	if err != nil {
+		return nil, err
 	}
 
 	if len(c.ExpectedIPs) == 0 {
@@ -139,14 +115,14 @@ func (c *NameServerConfig) Build() (*dns.NameServer, error) {
 		}
 	}
 
-	expectedGeoipList, err := ToCidrList(newExpectedIPs)
+	expectedIPRules, err := geodata.ParseIPRules(newExpectedIPs)
 	if err != nil {
-		return nil, errors.New("invalid expected IP rule: ", c.ExpectedIPs).Base(err)
+		return nil, err
 	}
 
-	unexpectedGeoipList, err := ToCidrList(newUnexpectedIPs)
+	unexpectedIPRules, err := geodata.ParseIPRules(newUnexpectedIPs)
 	if err != nil {
-		return nil, errors.New("invalid unexpected IP rule: ", c.UnexpectedIPs).Base(err)
+		return nil, err
 	}
 
 	var myClientIP []byte
@@ -163,30 +139,24 @@ func (c *NameServerConfig) Build() (*dns.NameServer, error) {
 			Address: c.Address.Build(),
 			Port:    uint32(c.Port),
 		},
-		ClientIp:          myClientIP,
-		SkipFallback:      c.SkipFallback,
-		PrioritizedDomain: domains,
-		ExpectedGeoip:     expectedGeoipList,
-		OriginalRules:     originalRules,
-		QueryStrategy:     resolveQueryStrategy(c.QueryStrategy),
-		ActPrior:          actPrior,
-		Tag:               c.Tag,
-		TimeoutMs:         c.TimeoutMs,
-		DisableCache:      c.DisableCache,
-		FinalQuery:        c.FinalQuery,
-		UnexpectedGeoip:   unexpectedGeoipList,
-		ActUnprior:        actUnprior,
+		ClientIp:        myClientIP,
+		SkipFallback:    c.SkipFallback,
+		Domain:          domainRules,
+		ExpectedIp:      expectedIPRules,
+		QueryStrategy:   resolveQueryStrategy(c.QueryStrategy),
+		ActPrior:        actPrior,
+		Tag:             c.Tag,
+		TimeoutMs:       c.TimeoutMs,
+		DisableCache:    c.DisableCache,
+		ServeStale:      c.ServeStale,
+		ServeExpiredTTL: c.ServeExpiredTTL,
+		FinalQuery:      c.FinalQuery,
+		UnexpectedIp:    unexpectedIPRules,
+		ActUnprior:      actUnprior,
 	}, nil
 }
 
-var typeMap = map[router.Domain_Type]dns.DomainMatchingType{
-	router.Domain_Full:   dns.DomainMatchingType_Full,
-	router.Domain_Domain: dns.DomainMatchingType_Subdomain,
-	router.Domain_Plain:  dns.DomainMatchingType_Keyword,
-	router.Domain_Regex:  dns.DomainMatchingType_Regex,
-}
-
-// DNSConfig is a JSON serializable object for dns.Config.
+// DNSConfig is a JSON serializable object for dns.Config
 type DNSConfig struct {
 	Servers                []*NameServerConfig `json:"servers"`
 	Hosts                  *HostsWrapper       `json:"hosts"`
@@ -194,8 +164,11 @@ type DNSConfig struct {
 	Tag                    string              `json:"tag"`
 	QueryStrategy          string              `json:"queryStrategy"`
 	DisableCache           bool                `json:"disableCache"`
+	ServeStale             bool                `json:"serveStale"`
+	ServeExpiredTTL        uint32              `json:"serveExpiredTTL"`
 	DisableFallback        bool                `json:"disableFallback"`
 	DisableFallbackIfMatch bool                `json:"disableFallbackIfMatch"`
+	EnableParallelQuery    bool                `json:"enableParallelQuery"`
 	UseSystemHosts         bool                `json:"useSystemHosts"`
 }
 
@@ -235,7 +208,7 @@ type HostsWrapper struct {
 	Hosts map[string]*HostAddress
 }
 
-func getHostMapping(ha *HostAddress) *dns.Config_HostMapping {
+func newHostMapping(ha *HostAddress) *dns.Config_HostMapping {
 	if ha.addr != nil {
 		if ha.addr.Family().IsDomain() {
 			return &dns.Config_HostMapping{
@@ -279,109 +252,15 @@ func (m *HostsWrapper) UnmarshalJSON(data []byte) error {
 
 // Build implements Buildable
 func (m *HostsWrapper) Build() ([]*dns.Config_HostMapping, error) {
-	mappings := make([]*dns.Config_HostMapping, 0, 20)
-
-	domains := make([]string, 0, len(m.Hosts))
-	for domain := range m.Hosts {
-		domains = append(domains, domain)
-	}
-	sort.Strings(domains)
-
-	for _, domain := range domains {
-		switch {
-		case strings.HasPrefix(domain, "domain:"):
-			domainName := domain[7:]
-			if len(domainName) == 0 {
-				return nil, errors.New("empty domain type of rule: ", domain)
-			}
-			mapping := getHostMapping(m.Hosts[domain])
-			mapping.Type = dns.DomainMatchingType_Subdomain
-			mapping.Domain = domainName
-			mappings = append(mappings, mapping)
-
-		case strings.HasPrefix(domain, "geosite:"):
-			listName := domain[8:]
-			if len(listName) == 0 {
-				return nil, errors.New("empty geosite rule: ", domain)
-			}
-			geositeList, err := loadGeositeWithAttr("geosite.dat", listName)
-			if err != nil {
-				return nil, errors.New("failed to load geosite: ", listName).Base(err)
-			}
-			for _, d := range geositeList {
-				mapping := getHostMapping(m.Hosts[domain])
-				mapping.Type = typeMap[d.Type]
-				mapping.Domain = d.Value
-				mappings = append(mappings, mapping)
-			}
-
-		case strings.HasPrefix(domain, "regexp:"):
-			regexpVal := domain[7:]
-			if len(regexpVal) == 0 {
-				return nil, errors.New("empty regexp type of rule: ", domain)
-			}
-			mapping := getHostMapping(m.Hosts[domain])
-			mapping.Type = dns.DomainMatchingType_Regex
-			mapping.Domain = regexpVal
-			mappings = append(mappings, mapping)
-
-		case strings.HasPrefix(domain, "keyword:"):
-			keywordVal := domain[8:]
-			if len(keywordVal) == 0 {
-				return nil, errors.New("empty keyword type of rule: ", domain)
-			}
-			mapping := getHostMapping(m.Hosts[domain])
-			mapping.Type = dns.DomainMatchingType_Keyword
-			mapping.Domain = keywordVal
-			mappings = append(mappings, mapping)
-
-		case strings.HasPrefix(domain, "full:"):
-			fullVal := domain[5:]
-			if len(fullVal) == 0 {
-				return nil, errors.New("empty full domain type of rule: ", domain)
-			}
-			mapping := getHostMapping(m.Hosts[domain])
-			mapping.Type = dns.DomainMatchingType_Full
-			mapping.Domain = fullVal
-			mappings = append(mappings, mapping)
-
-		case strings.HasPrefix(domain, "dotless:"):
-			mapping := getHostMapping(m.Hosts[domain])
-			mapping.Type = dns.DomainMatchingType_Regex
-			switch substr := domain[8:]; {
-			case substr == "":
-				mapping.Domain = "^[^.]*$"
-			case !strings.Contains(substr, "."):
-				mapping.Domain = "^[^.]*" + substr + "[^.]*$"
-			default:
-				return nil, errors.New("substr in dotless rule should not contain a dot: ", substr)
-			}
-			mappings = append(mappings, mapping)
-
-		case strings.HasPrefix(domain, "ext:"):
-			kv := strings.Split(domain[4:], ":")
-			if len(kv) != 2 {
-				return nil, errors.New("invalid external resource: ", domain)
-			}
-			filename := kv[0]
-			list := kv[1]
-			geositeList, err := loadGeositeWithAttr(filename, list)
-			if err != nil {
-				return nil, errors.New("failed to load domain list: ", list, " from ", filename).Base(err)
-			}
-			for _, d := range geositeList {
-				mapping := getHostMapping(m.Hosts[domain])
-				mapping.Type = typeMap[d.Type]
-				mapping.Domain = d.Value
-				mappings = append(mappings, mapping)
-			}
-
-		default:
-			mapping := getHostMapping(m.Hosts[domain])
-			mapping.Type = dns.DomainMatchingType_Full
-			mapping.Domain = domain
-			mappings = append(mappings, mapping)
+	mappings := make([]*dns.Config_HostMapping, 0, len(m.Hosts))
+	for rule, addrs := range m.Hosts {
+		mapping := newHostMapping(addrs)
+		rule, err := geodata.ParseDomainRule(rule, geodata.Domain_Full)
+		if err != nil {
+			return nil, err
 		}
+		mapping.Domain = rule
+		mappings = append(mappings, mapping)
 	}
 	return mappings, nil
 }
@@ -391,8 +270,11 @@ func (c *DNSConfig) Build() (*dns.Config, error) {
 	config := &dns.Config{
 		Tag:                    c.Tag,
 		DisableCache:           c.DisableCache,
+		ServeStale:             c.ServeStale,
+		ServeExpiredTTL:        c.ServeExpiredTTL,
 		DisableFallback:        c.DisableFallback,
 		DisableFallbackIfMatch: c.DisableFallbackIfMatch,
+		EnableParallelQuery:    c.EnableParallelQuery,
 		QueryStrategy:          resolveQueryStrategy(c.QueryStrategy),
 	}
 
@@ -403,11 +285,78 @@ func (c *DNSConfig) Build() (*dns.Config, error) {
 		config.ClientIp = []byte(c.ClientIP.IP())
 	}
 
+	// Build PolicyID
+	policyMap := map[string]uint32{}
+	nextPolicyID := uint32(1)
+	buildPolicyID := func(nsc *NameServerConfig) uint32 {
+		var sb strings.Builder
+
+		// ClientIP
+		if nsc.ClientIP != nil {
+			sb.WriteString("client=")
+			sb.WriteString(nsc.ClientIP.String())
+			sb.WriteByte('|')
+		} else {
+			sb.WriteString("client=none|")
+		}
+
+		// SkipFallback
+		if nsc.SkipFallback {
+			sb.WriteString("skip=1|")
+		} else {
+			sb.WriteString("skip=0|")
+		}
+
+		// QueryStrategy
+		sb.WriteString("qs=")
+		sb.WriteString(strings.ToLower(strings.TrimSpace(nsc.QueryStrategy)))
+		sb.WriteByte('|')
+
+		// Tag
+		sb.WriteString("tag=")
+		sb.WriteString(strings.ToLower(strings.TrimSpace(nsc.Tag)))
+		sb.WriteByte('|')
+
+		// []string helper
+		writeList := func(tag string, lst []string) {
+			if len(lst) == 0 {
+				sb.WriteString(tag)
+				sb.WriteString("=[]|")
+				return
+			}
+			cp := make([]string, len(lst))
+			for i, s := range lst {
+				cp[i] = strings.TrimSpace(strings.ToLower(s))
+			}
+			sort.Strings(cp)
+			sb.WriteString(tag)
+			sb.WriteByte('=')
+			sb.WriteString(strings.Join(cp, ","))
+			sb.WriteByte('|')
+		}
+
+		writeList("domains", nsc.Domains)
+		writeList("expected", nsc.ExpectedIPs)
+		writeList("expect", nsc.ExpectIPs)
+		writeList("unexpected", nsc.UnexpectedIPs)
+
+		key := sb.String()
+
+		if id, ok := policyMap[key]; ok {
+			return id
+		}
+		id := nextPolicyID
+		nextPolicyID++
+		policyMap[key] = id
+		return id
+	}
+
 	for _, server := range c.Servers {
 		ns, err := server.Build()
 		if err != nil {
 			return nil, errors.New("failed to build nameserver").Base(err)
 		}
+		ns.PolicyID = buildPolicyID(server)
 		config.NameServer = append(config.NameServer, ns)
 	}
 
@@ -423,9 +372,7 @@ func (c *DNSConfig) Build() (*dns.Config, error) {
 		if err != nil {
 			return nil, errors.New("failed to read system hosts").Base(err)
 		}
-		for domain, ips := range systemHosts {
-			config.StaticHosts = append(config.StaticHosts, &dns.Config_HostMapping{Ip: ips, Domain: domain, Type: dns.DomainMatchingType_Full})
-		}
+		config.StaticHosts = append(config.StaticHosts, systemHosts...)
 	}
 
 	return config, nil
@@ -446,7 +393,7 @@ func resolveQueryStrategy(queryStrategy string) dns.QueryStrategy {
 	}
 }
 
-func readSystemHosts() (map[string][][]byte, error) {
+func readSystemHosts() ([]*dns.Config_HostMapping, error) {
 	var hostsPath string
 	switch runtime.GOOS {
 	case "windows":
@@ -461,12 +408,16 @@ func readSystemHosts() (map[string][][]byte, error) {
 	}
 	defer file.Close()
 
-	hostsMap := make(map[string][][]byte)
-	scanner := bufio.NewScanner(file)
+	return readSystemHostsFrom(file)
+}
+
+func readSystemHostsFrom(r io.Reader) ([]*dns.Config_HostMapping, error) {
+	hosts := make(map[string][][]byte, 16)
+	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if i := strings.IndexByte(line, '#'); i >= 0 {
-			// Discard comments.
+			// Strip inline comments before splitting the line into fields.
 			line = line[0:i]
 		}
 		f := strings.Fields(line)
@@ -477,19 +428,28 @@ func readSystemHosts() (map[string][][]byte, error) {
 		if addr.Family().IsDomain() {
 			continue
 		}
-		ip := addr.IP()
 		for i := 1; i < len(f); i++ {
 			domain := strings.TrimSuffix(f[i], ".")
 			domain = strings.ToLower(domain)
-			if v, ok := hostsMap[domain]; ok {
-				hostsMap[domain] = append(v, ip)
-			} else {
-				hostsMap[domain] = [][]byte{ip}
-			}
+			hosts[domain] = append(hosts[domain], addr.IP())
 		}
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, err
 	}
+
+	hostsMap := make([]*dns.Config_HostMapping, 0, len(hosts))
+	for domain, ips := range hosts {
+		// ParseDomainRule accepts rule syntax too, not just plain domains.
+		rule, err := geodata.ParseDomainRule(domain, geodata.Domain_Full)
+		if err != nil {
+			return nil, err
+		}
+		hostsMap = append(hostsMap, &dns.Config_HostMapping{
+			Domain: rule,
+			Ip:     ips,
+		})
+	}
+
 	return hostsMap, nil
 }
