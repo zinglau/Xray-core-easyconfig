@@ -132,6 +132,7 @@ type InboundDetourConfig struct {
 	Tag            string           `json:"tag"`
 	StreamSetting  *StreamConfig    `json:"streamSettings"`
 	SniffingConfig *SniffingConfig  `json:"sniffing"`
+	Template       string           `json:"template"`
 }
 
 // Build implements Buildable.
@@ -220,6 +221,7 @@ type OutboundDetourConfig struct {
 	ProxySettings  *ProxyConfig     `json:"proxySettings"`
 	MuxSettings    *MuxConfig       `json:"mux"`
 	TargetStrategy string           `json:"targetStrategy"`
+	Template       string           `json:"template"`
 }
 
 func (c *OutboundDetourConfig) checkChainProxyConfig() error {
